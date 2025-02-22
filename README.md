@@ -1,6 +1,6 @@
 # Spawn
 
-**Spawn** is a Python-based audio manager that imports music tracks, standardizes and enriches metadata (tags, MBIDs, ReplayGain, etc.), provides a flexible favorites system, creates curated playlists, and can play M3U files (via [mpv](https://mpv.io/)).
+**Spawn** is a Python‑based audio manager that imports music tracks, standardizes and enriches metadata (tags, MBIDs, ReplayGain, etc.), and provides a flexible system for favorites, curation, and playback. It also automatically creates symlinks for all imported tracks to enable universal playlist functionality.
 
 ## Table of Contents
 
@@ -8,6 +8,7 @@
 - [Installation](#installation)
   - [System Requirements](#system-requirements)
   - [Python Dependencies](#python-dependencies)
+- [Library Directory Structure](#library-directory-structure)
 - [Usage](#usage)
   - [1. Import Tracks](#1-import-tracks)
   - [2. Update Favorites](#2-update-favorites)
@@ -23,24 +24,38 @@
 ## Features
 
 - **Audio Import & Standardization:**  
-  Cleans and repackages AAC/ALAC/FLAC to a uniform M4A format, embedding [MusicBrainz](https://musicbrainz.org/) IDs, [AcoustID](https://acoustid.org/) fingerprints, and more.
+  Import audio files (AAC, ALAC, FLAC, MP4) and convert them to a standardized M4A format. During import, Spawn:
+  - Cleans and repackages audio using ffmpeg, MP4Box, and bs1770gain (for ReplayGain).
+  - Automatically extracts, canonicalizes, and enriches metadata including MusicBrainz IDs, AcoustID fingerprints, and Spotify track IDs.
+  - Computes album‑level ReplayGain and assigns a unique 8‑digit hexadecimal Spawn ID to each track.
+  - Generates advanced track embeddings (using a Deej‑AI‑inspired encoder) for improved playlist curation.
 
 - **Favorites System:**  
-  Track your favorite artists, albums, or tracks. Filter curated playlists by those favorites.
+  Manage and update your favorite artists, albums, or tracks. Favorites are stored in JSON files and can be used to filter curated playlists.
 
 - **Curated Playlists:**  
-  - Group tracks by into canonical genre clusters
-  - Leverage a detailed genre dictionary ([`dic_spawnre.py`](./spawn/dic_spawnre.py)) that supports subgenres, *multi-parent* relationships, and synonyms.
-  - Reorder clusters by “related” subgenres, optionally filter by favorites, and output an `.m3u` playlist.
-  - Optionally use advanced embeddings or numeric audio features to achieve *smooth transitions*.
+  Spawn supports several playlist curation methods:
+  - **Basic Curation:** Groups tracks by genre (using a comprehensive genre dictionary with subgenre and synonym support), then shuffles tracks within each cluster.
+  - **Feature‑Based Curation:** Uses numeric audio features (e.g. tempo, loudness) to reorder tracks in each genre cluster.
+  - **Advanced Curation:** Leverages track embeddings and a trained ML model to implement a “chain‑based” nearest‑neighbor approach for smooth transitions between tracks, based on the Deej-AI project (https://github.com/teticio/Deej-AI)
+  - **Personalized Recommendations:** After filtering by favorites, users can opt to generate a playlist of tracks with a high `like_likelihood` score, selecting tracks similar to their favorites.
 
 - **M3U Playback (via mpv):**  
-  Select an `.m3u` file and easily play it with mpv from the command line.
+  Easily play curated playlists with mpv. Spawn scans for `.m3u` files and launches mpv with the selected playlist.
 
-- **Optional API Integrations:**  
-  - [Spotify](https://spotipy.readthedocs.io/) for searching and matching track IDs or audio features.  
-  - [Last.fm](https://www.last.fm/api) for genre/fingerprint lookups.  
-  - [MusicBrainzNGS](https://python-musicbrainzngs.readthedocs.io/) for MBIDs.
+- **Symlink Generation:**  
+  During import, Spawn automatically creates symbolic links for every track with a unique Spawn ID. These symlinks are stored directly in the `Spawn/aux/user/linx/` folder (named `<SpawnID>.m4a`) to enable consistent file paths for universal playlists.
+
+- **Embeddings & Metadata Storage:**  
+  - Track embeddings are stored in `mp4tovec.p`, a pickle file located in `Spawn/aux/glob/`, and updated whenever new tracks are added.
+  - Track metadata is stored in `spawn_catalog.db` (for all cataloged tracks) and `spawn_library.db` (for user-specific tracks).
+
+- **API Integrations:**  
+  Spawn integrates with external services such as Spotify, Last.fm, MusicBrainz, and AcoustID for enhanced metadata and audio fingerprinting.
+
+- **Admin vs. User Mode:**  
+  - **Admin Mode:** New or updated tracks are written to `spawn_catalog.db`, embeddings are generated, and all metadata is updated.
+  - **User Mode:** Users access a subset of the catalog via `spawn_library.db`, where `cat_tracks` holds catalog tracks and `lib_tracks` holds unique user tracks.
 
 ---
 
@@ -48,19 +63,19 @@
 
 ### System Requirements
 
-- **Python 3.6 or higher** (tested up to Python 3.10).  
-- **ReplayGain**
-  - On macOS, install via 'brew install rsgain'
-  - On Ubuntu/Debian, 'sudo apt install rsgain'
-  - On Windows, see https://github.com/complexlogic/rsgain
-- **mpv** media player (for playlist playback):  
-  - On macOS, install via `brew install mpv`  
-  - On Ubuntu/Debian, `sudo apt-get install mpv`  
-  - On Windows, see [mpv.io installation guide](https://mpv.io/installation/)  
-- For advanced features (optional):
-  - [ffmpeg](https://ffmpeg.org/) (for ALAC/FLAC conversions).
-  - [MP4Box](https://gpac.wp.imt.fr/downloads/) (for AAC cleaning).
-  - [chromaprint](https://acoustid.org/chromaprint) / `fpcalc` (for AcoustID fingerprinting).
+- **Python 3.6 or higher** (tested with Python 3.10).
+- **ReplayGain:**  
+  - macOS: `brew install rsgain`
+  - Ubuntu/Debian: `sudo apt install rsgain`
+  - Windows: see [rsgain on GitHub](https://github.com/complexlogic/rsgain)
+- **mpv** (for playlist playback):  
+  - macOS: `brew install mpv`
+  - Ubuntu/Debian: `sudo apt-get install mpv`
+  - Windows: see [mpv installation guide](https://mpv.io/installation/)
+- **Optional (for audio conversion and fingerprinting):**  
+  - ffmpeg  
+  - MP4Box  
+  - chromaprint/fpcalc
 
 ### Python Dependencies
 
@@ -72,7 +87,7 @@ cd Spawn
 pip install -r requirements.txt
 ```
 
-Or if using the setup.py:
+Or, if using setup.py:
 
 ```bash
 git clone https://github.com/SpawnID0000/Spawn.git
@@ -80,102 +95,144 @@ cd Spawn
 python setup.py install
 ```
 
-Dependencies (summarized):
-- mutagen (https://mutagen.readthedocs.io/)
-- spotipy (https://spotipy.readthedocs.io/)
-- musicbrainzngs (https://python-musicbrainzngs.readthedocs.io/)
-- requests, Pillow, python-dotenv
-- python-mpv (wrapping mpv; mpv must still be installed system-wide) (https://pypi.org/project/python-mpv/)
-- …and others in requirements.txt.
+Dependencies include:
+- mutagen
+- spotipy
+- musicbrainzngs
+- requests, Pillow, python-dotenv, python-mpv
+- numpy, torch
+- …and others listed in requirements.txt.
+
+---
+
+## Library Directory Structure
+
+When you import tracks, Spawn organizes your library under your LIB_PATH/Spawn directory. An example structure is as follows:
+
+```
+LIB_PATH/Spawn
+├── Music
+│   └── Artist
+│       └── Album
+│           ├── D-TT [spawn_id] - Title.m4a
+│           └── cover.jpg
+├── Playlists
+│   ├── Curated
+│   │   └── curate_YYYY-MM-DD_HHMMSS.m3u
+│   └── Imported
+│       └── import_YYYY-MM-DD_HHMM.m3u
+└── aux
+    ├── glob
+    │   ├── mp4tovec.p
+    │   └── spawn_catalog.db
+    ├── temp
+    │   └── import_log.txt
+    └── user
+        ├── favs
+        │   ├── fav_albums.json
+        │   ├── fav_artists.json
+        │   └── fav_tracks.json
+        ├── hart
+        │   └── Artist
+        │       └── Album
+        │           └── cover_hi-res.jpg
+        ├── linx
+        │   └── spawn_id.m4a
+        └── spawn_library.db
+```
+
+---
 
 ## Usage
 
-If you installed via setup.py (which includes the console script entry), you can run:
+After installation, you can run Spawn from the command line:
+
 ```bash
 spawn
 ```
 
-Or, if you’re running from source, do:
+Or from source:
+
 ```bash
 python -m spawn.main
 ```
 
-You’ll see a text menu like:
+You will see a text menu:
+
 ```
 Select one of the following options:
-   (or press any other key to exit)
+   (or type 'quit' to exit)
 
     1) Import tracks
     2) Update favorites
     3) Create curated playlist
     4) Play M3U playlist
-
-Enter choice:
 ```
 
 ### 1. Import Tracks
-- **Purpose:** Repackage, standardize metadata, optionally fetch MBIDs, compute ReplayGain, etc.
-- **Implementation:** track_importer.py
-- **Usage:**
-  - Enter “1” from the main menu.
-  - Provide input folder (where your raw audio is).
-  - Provide (or confirm) the LIB_PATH for your local Spawn library.
-
-Tracks will be processed, cleaned, assigned a spawn_ID and stored in your Spawn/Music folder with standardized tags and naming convention.
+- **Purpose:**  
+  Repackage raw audio, standardize metadata (including MBIDs, ReplayGain, and embeddings), and assign a unique Spawn ID to each track.
+- **Details:**  
+  The import process supports both Admin and User modes. In Admin Mode, new tracks are stored in the main catalog database; in User Mode, they are stored in the user library database.
+- **Usage:**  
+  Select “1” from the main menu and follow the prompts.
 
 ### 2. Update Favorites
-- **Purpose:** Add or edit your favorite artists, albums, or tracks.
-- **Implementation:** favs.py
-- **Usage:**
-  - Enter “2” from the main menu.
-  - Choose which favorites you want to update (artists, albums, or tracks).
-  - Provide an .m3u that references them.
-  - Favorites are saved in JSON under Spawn/aux/user/favs/fav_artists.json, fav_albums.json, fav_tracks.json.
+- **Purpose:**  
+  Manage your favorite artists, albums, and tracks.
+- **Usage:**  
+  Select “2” and follow the prompts to update your JSON‑formatted favorites lists, which are stored under `Spawn/aux/user/favs/`.
 
 ### 3. Create Curated Playlist
-- **Purpose:** Build an .m3u from your library, grouping by “spawnre” or fallback genre, optionally filtering by favorites.
-- **Implementation:** curator.py
-- **Usage:**
-  - Enter “3” from the main menu.
-  - Optionally filter by favorite artists, albums, or tracks.
-  - The script clusters your tracks by genre, allows reordering, and writes a curated .m3u to Spawn/Playlists/Curated/.
-    - **Basic Mode:** Randomly shuffle tracks within each genre cluster.
-    - **Feature Mode:** Use numeric audio features (tempo, loudness, etc.) to do a nearest-neighbor chain within each cluster.
-    - **Advanced Mode:** Use embeddings plus a “chain-based” approach to refine cluster membership (with an “outliers” bucket if needed).
-                          Includes code & trained model from Deej-AI: https://github.com/teticio/Deej-AI).
+- **Purpose:**  
+  Generate an `.m3u` playlist from your library. You can choose between basic, feature‑based, or advanced (Deej‑AI) curation.
+- **Usage:**  
+  Select “3” from the main menu. You may filter by favorites and then choose between advanced or feature‑based ordering.
+- **Note:**  
+  In User Mode, only tracks stored in the user library database (those with Spawn IDs in the `cat_tracks` table) are included.
 
 ### 4. Play M3U Playlist
-- **Purpose:** Launch mpv with a chosen .m3u.
-- **Implementation:** player.py
-- **Usage:**
-  - Enter “4” from the main menu.
-  - Select from discovered .m3u files in Spawn/Playlists/ or manually type a path.
-  - mpv then plays the tracks in that playlist.
+- **Purpose:**  
+  Launch mpv to play a selected `.m3u` playlist.
+- **Usage:**  
+  Select “4” and choose a playlist from the displayed list or enter a custom path.
+
 
 ## Modules Overview
-1. **track_importer.py**
-   Handles audio standardization, tag rewriting, MBIDs, replaygain, etc.
-2. **favs.py**
-   Manages your JSON favorites lists (fav_artists.json, fav_albums.json, fav_tracks.json).
-3. **curator.py**
-   Creates curated playlists from your library, optionally filtering by favorites, grouping by genre, reordering clusters via “Related” relationships, or advanced embedding approaches.
-4. **player.py**
-   Finds .m3u files and plays them in mpv.
-5. **main.py**
-   Provides the CLI menu. Imports the other modules and orchestrates user input.
+
+- **main.py**  
+  The central CLI menu that integrates all functionalities.
+- **track_importer.py**  
+  Handles audio file processing, metadata standardization, MBID and ReplayGain lookups, embedding generation, file renaming, and symlink creation.
+- **favs.py**  
+  Manages your JSON‑formatted favorites lists (fav_artists.json, fav_albums.json, fav_tracks.json).
+- **curator.py**  
+  Provides multiple curation methods (basic, feature‑based, advanced) for grouping tracks by genre, ordering clusters via relationships or embeddings, and writing curated M3U playlists.
+- **audiodiffusion/**  
+  Contains Deej-AI–inspired modules for embedding generation.
+- **likey.py**  
+  Computes `like_likelihood` scores based on embeddings to recommend new tracks similar to the user’s favorites.
+- **symlinker.py**  
+  Ensures every track with a unique Spawn ID has a symlink for universal playlist support.
+- **player.py**  
+  Finds `.m3u` files and plays them with mpv.
 
 ## Additional Configuration
-- **APId.env or settings.env**  
-  You can store environment variables (like Spotify Client ID, Last.fm API key, etc.) in .env files. The code uses python-dotenv to load them.
-- **Spawn Catalog DB**  
-  We store track metadata in spawn_catalog.db (SQLite) under Spawn/aux/glob/.
-- **File Paths**  
-  - Library path: Typically LIB_PATH/Spawn/Music. Set LIB_PATH in settings.env.
-  - Logs & Aux: In Spawn/aux/temp, etc.
-- **ReplayGain (optional)**  
-  For album-level loudness balancing, install bs1770gain, and track_importer.py can call it.
-- **Audio Feature-based Curation (optional future step)**  
-  For advanced track ordering, librosa is used to extract numeric features (tempo, loudness, key, etc.) and store them in spawn_catalog.db. Then curator.py can read these features for advanced ordering logic. Future improvements or ML-based heuristics can further refine features like valence, danceability, speechiness, etc.
+
+- **Environment Files:**  
+  Use `APId.env` or `settings.env` to set API keys (Spotify, Last.fm, etc.) and other configuration values (such as LIB_PATH).
+- **Database:**  
+  Track metadata is stored in SQLite databases:
+  - Admin mode uses `Spawn/aux/glob/spawn_catalog.db` (table “tracks”).
+  - User mode uses `Spawn/aux/user/spawn_library.db` (table “cat_tracks”).
+- **Auxiliary Directories:**  
+  - Library path: Typically LIB_PATH/Spawn/Music.
+  - Logs and temporary files are saved under `Spawn/aux/temp/`.
+  - Custom cluster orders for curation are stored in `Spawn/aux/user/cur8/`.
+- **ReplayGain (optional):**  
+  For album-level loudness balancing, install bs1770gain.
+- **Audio Feature-based Curation (optional):**  
+  For advanced track ordering, librosa and/or a Deej‑AI model are used.
 
 ## License
 
@@ -183,10 +240,9 @@ Distributed under the GNU General Public License v3 (GPLv3). See the LICENSE fil
 
 ## Contributing
 
-Contributions are welcome! Feel free to:
-- Open an issue or pull request on GitHub: https://github.com/SpawnID0000/Spawn
+Contributions are welcome! To contribute:
+- Open an issue or pull request on GitHub: [https://github.com/SpawnID0000/Spawn](https://github.com/SpawnID0000/Spawn)
 - Submit bug reports, feature requests, or code improvements.
-
-Please ensure that your contributions are consistent with the project license. For major changes, open an issue first to discuss.
+- For major changes, please open an issue first to discuss your ideas.
 
 Thanks for using Spawn! If you have any questions or issues, please contact us at spawn.id.0000@gmail.com.
