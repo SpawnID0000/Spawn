@@ -5,6 +5,8 @@ import json
 import difflib
 import shlex
 import sqlite3
+import glob
+from mutagen import File as AudioFile
 
 
 FAVS_FOLDER = "Spawn/aux/user/favs"  # subfolder relative to LIB_PATH
@@ -16,6 +18,7 @@ def update_favorites_menu(spawn_root):
     then prompts user to enter M3U/CSV file path or direct list of Spawn IDs.
     It then parses the input and saves the resulting favorites to separate
     JSON files (fav_artists.json, etc.).
+    If option 4 is chosen, favorite tracks are exported as an M3U file.
     
     :param spawn_root: The root path to the Spawn project (where "aux/user/favs" resides).
     """
@@ -23,16 +26,23 @@ def update_favorites_menu(spawn_root):
     print("    1) Artists")
     print("    2) Albums")
     print("    3) Tracks")
+    print("\nOr, alternatively:")
+    print("    4) Export M3U of Favorite Tracks")
 
+    valid_choices = ["1", "2", "3", "4"]
     while True:
         choice = input("\nEnter choice: ").strip()
-
-        if choice not in ["1", "2", "3"]:
+        if choice not in valid_choices:
             print("[WARN] Invalid choice. Please select from the options listed.")
         else:
             break
 
-    # Prompt for input: M3U file, CSV file, or direct Spawn IDs
+    # Export favorite tracks as M3U (for choice 4)
+    if choice == "4":
+        export_favorite_tracks_m3u(spawn_root)
+        return
+
+    # Prompt for input (for choices 1, 2, and 3): M3U file, CSV file, or direct Spawn IDs
     input_path = input("Enter the path to an M3U or CSV file listing your favorites, or directly enter Spawn IDs here: ").strip()
     parts = shlex.split(input_path)
     if not parts:
@@ -355,6 +365,202 @@ def update_favorites_menu(spawn_root):
     else:
         print(f"[INFO] No non-matched {fav_type} to report.")
 
+
+def extract_track_title_from_filename(filename):
+    """
+    Given a filename like "1-04 [09F96F80] - All Mixed Up.m4a",
+    extract the track title portion (e.g., "All Mixed Up").
+    If the filename does not contain " - ", returns the base filename.
+    The returned title is normalized to lowercase.
+    """
+    base = os.path.splitext(os.path.basename(filename))[0]
+    parts = base.split(" - ", 1)
+    if len(parts) == 2:
+        return parts[1].strip().lower()
+    return base.strip().lower()
+
+
+def extract_spawn_id_from_filename(filename):
+    """
+    Given a filename in the expected format "D-TT [spawn_id] - Title.m4a",
+    extract and return the spawn_id (as uppercase). If not found, returns None.
+    """
+    base = os.path.basename(filename)
+    match = re.search(r'\[([^\]]+)\]', base)
+    if match:
+        return match.group(1).upper()
+    return None
+
+def fuzzy_search_by_title(directory, target_title, threshold=0.8):
+    """
+    Recursively searches for a file in directory whose extracted title
+    is similar to target_title above a given threshold.
+    
+    :param directory: Folder to search.
+    :param target_title: Expected track title (lowercase).
+    :param threshold: Similarity ratio threshold (0.0-1.0).
+    :return: Full path of best matching file, or None.
+    """
+    best_match = None
+    best_ratio = threshold
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            candidate_title = extract_track_title_from_filename(file)
+            ratio = difflib.SequenceMatcher(None, candidate_title, target_title).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_match = os.path.join(root, file)
+    return best_match
+
+def find_track_filepath(spawn_root, track_obj):
+    """
+    Attempts to locate the actual file path of a track given its metadata.
+    It first searches under the expected album (or artist) folder using an exact
+    title match. If that fails, and if a spawn_id is provided, it will search
+    the entire Music folder for a file whose name contains the spawn_id in the
+    expected format. Finally, it performs a fuzzy search by title.
+    
+    :param spawn_root: The LIB_PATH (root of your Spawn project).
+    :param track_obj: Dictionary with keys: artist, album, track, spawn_id.
+    :return: The full file path if found; otherwise, None.
+    """
+    music_folder = os.path.join(spawn_root, "Spawn", "Music")
+    artist = track_obj.get("artist", "").strip()
+    album = track_obj.get("album", "").strip()
+    target_title = track_obj.get("track", "").strip().lower()
+    spawn_id_expected = track_obj.get("spawn_id", "").strip().upper()
+    
+    if not artist or not target_title:
+        return None
+
+    # Use the album folder if available, otherwise the artist folder.
+    if album:
+        base_dir = os.path.join(music_folder, artist, album)
+    else:
+        base_dir = os.path.join(music_folder, artist)
+
+    def search_in_directory(directory):
+        if not os.path.isdir(directory):
+            return None
+        for file in os.listdir(directory):
+            full_path = os.path.join(directory, file)
+            if os.path.isfile(full_path):
+                extracted_title = extract_track_title_from_filename(file)
+                if extracted_title == target_title:
+                    return full_path
+        return None
+
+    # 1. Search in the base directory by title match.
+    found = search_in_directory(base_dir)
+    if found:
+        return found
+
+    # 2. Perform a recursive search in the base directory by title.
+    for root, dirs, files in os.walk(base_dir):
+        for file in files:
+            if extract_track_title_from_filename(file) == target_title:
+                return os.path.join(root, file)
+
+    # 3. As a fallback, if spawn_id is provided, search the entire Music folder.
+    if spawn_id_expected:
+        pattern = os.path.join(music_folder, f"*[{spawn_id_expected}]*")
+        candidates = glob.glob(pattern)
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                candidate_spawn = extract_spawn_id_from_filename(candidate)
+                if candidate_spawn and candidate_spawn == spawn_id_expected:
+                    return candidate
+
+    # 4. Final fallback: Fuzzy search in the entire Music folder by title.
+    fuzzy_match = fuzzy_search_by_title(music_folder, target_title, threshold=0.8)
+    if fuzzy_match:
+        return fuzzy_match
+    
+    return None
+
+def get_audio_duration(file_path):
+    """
+    Uses Mutagen to load the audio file and return its duration in seconds.
+    Returns -1 if the duration cannot be determined.
+    
+    :param file_path: The full path to the audio file.
+    :return: Duration in seconds (integer) or -1 on failure.
+    """
+    try:
+        audio = AudioFile(file_path)
+        if audio is not None and hasattr(audio.info, 'length'):
+            # Round the duration to the nearest integer.
+            return int(round(audio.info.length))
+    except Exception as e:
+        print(f"[WARN] Failed to retrieve duration for '{file_path}': {e}")
+    return -1
+
+def export_favorite_tracks_m3u(spawn_root):
+    """
+    Exports the favorite tracks (from fav_tracks.json) to an M3U playlist.
+    For each track, it locates the file path using metadata; if not found,
+    it falls back to a spawn_id search and then fuzzy matching.
+    If still not found, the user is prompted.
+    The track duration is included in the EXTINF line.
+    
+    The M3U is saved as:
+        LIB_PATH/Spawn/Playlists/Favorites/favorite_tracks.m3u
+    """
+    # Load the favorite tracks from the existing JSON file in the favs folder.
+    favs_folder = os.path.join(spawn_root, FAVS_FOLDER)
+    fav_tracks_file = os.path.join(favs_folder, "fav_tracks.json")
+    
+    if not os.path.isfile(fav_tracks_file):
+        print("[INFO] No favorite tracks file found to export.")
+        return
+
+    favorite_tracks = load_favorites_file(fav_tracks_file)
+    if not favorite_tracks:
+        print("[INFO] Favorite tracks file is empty, nothing to export.")
+        return
+
+    # Create the export folder: LIB_PATH/Spawn/Playlists/Favorites
+    export_folder = os.path.join(spawn_root, "Spawn", "Playlists", "Favorites")
+    os.makedirs(export_folder, exist_ok=True)
+    
+    # Define the new export file path.
+    export_file = os.path.join(export_folder, "favorite_tracks.m3u")
+    
+    total_tracks = len(favorite_tracks)
+    print(f"[INFO] Processing {total_tracks} track(s). Please wait...")
+
+    try:
+        with open(export_file, "w", encoding="utf-8") as m3u:
+            m3u.write("#EXTM3U\n")
+            for idx, track in enumerate(favorite_tracks, 1):
+                if isinstance(track, dict):
+                    artist = track.get("artist", "Unknown Artist")
+                    title = track.get("track", "Unknown Title")
+                    spawn_id = track.get("spawn_id", "")
+                    file_path = find_track_filepath(spawn_root, track)
+                    
+                    # If still not found, prompt the user.
+                    if not file_path:
+                        print(f"\n[WARN] File for track '{artist} - {title}' not found.")
+                        user_input = input("Enter the full path to the file for this track (or leave blank to use spawn_id): ").strip()
+                        if user_input:
+                            try:
+                                parts = shlex.split(user_input)
+                                file_path = parts[0] if parts else user_input
+                            except Exception:
+                                file_path = user_input
+                        else:
+                            file_path = spawn_id
+                    duration = get_audio_duration(file_path) if file_path and os.path.isfile(file_path) else -1
+                    m3u.write(f"#EXTINF:{duration},{artist} - {title}\n")
+                    m3u.write(f"{file_path}\n")
+                elif isinstance(track, str):
+                    m3u.write(f"#EXTINF:-1,{track}\n")
+                    m3u.write(f"{track}\n")
+                print(f"[INFO] Processed {idx}/{total_tracks} tracks...", end='\r')
+        print(f"\n[INFO] Exported favorite tracks to M3U: {export_file}")
+    except Exception as e:
+        print(f"[ERROR] Failed to export M3U: {e}")
 
 def parse_m3u_custom(m3u_path):
     """
