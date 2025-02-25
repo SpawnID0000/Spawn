@@ -71,6 +71,28 @@ def create_symlink_for_track(track_path: str, spawn_root: str, spawn_id: str) ->
     except Exception as e:
         logger.error(f"Error creating symlink for {track_path} (spawn_id {spawn_id}): {e}")
 
+def collect_spawn_ids_from_symlinks(linx_dir: str) -> tuple:
+    """
+    Walk through the linx directory and extract spawn IDs from symlink filenames.
+    Returns a tuple: (set of spawn IDs, list of spawn IDs with broken targets)
+    """
+    spawn_ids = set()
+    broken_links = []
+    for file in os.listdir(linx_dir):
+        if file.startswith("."):
+            continue
+        if file.lower().endswith(".m4a"):
+            spawn_id = file[:-4]  # remove the '.m4a' extension
+            spawn_ids.add(spawn_id)
+            symlink_path = os.path.join(linx_dir, file)
+            try:
+                target_path = os.readlink(symlink_path)
+                if not os.path.exists(target_path):
+                    broken_links.append(spawn_id)
+            except Exception as e:
+                logger.error(f"Error reading symlink target for {symlink_path}: {e}")
+    return spawn_ids, broken_links
+
 def load_spawn_ids_from_db(db_path: str, table_name: str) -> set:
     """
     Connect to the SQLite database at db_path and return a set of Spawn IDs
@@ -113,7 +135,13 @@ def main():
     )
     parser.add_argument("spawn_path", help="Path to the Spawn directory (e.g. /Volumes/Untitled/Spawn)")
     parser.add_argument("-all", choices=["user", "admin"], help="If provided, compare spawn IDs from the DB and files. Use '-all user' for spawn_library.db or '-all admin' for spawn_catalog.db.")
+    parser.add_argument("-linx", action="store_true", help="Scan the symlink folder (aux/user/linx) instead of the Music folder.")
     args = parser.parse_args()
+
+    # Enforce that -linx is only valid when used with -all
+    if args.linx and not args.all:
+        logger.error("The -linx option must be used together with the -all option.")
+        sys.exit(1)
 
     spawn_root = os.path.abspath(args.spawn_path)
     music_dir = os.path.join(spawn_root, "Music")
@@ -125,7 +153,6 @@ def main():
         logger.error(f"Music directory not found at {music_dir}")
         sys.exit(1)
 
-    # If the -all option is provided, perform database comparison mode.
     if args.all:
         mode = args.all.lower()
         if mode == "admin":
@@ -133,38 +160,67 @@ def main():
             table_name = "tracks"
         else:  # user mode
             db_path = os.path.join(spawn_root, "aux", "user", "spawn_library.db")
-            # For user mode, we assume the curated tracks are in table "cat_tracks"
             table_name = "cat_tracks"
 
         db_spawn_ids = load_spawn_ids_from_db(db_path, table_name)
-        file_spawn_ids = collect_spawn_ids_from_files(music_dir)
 
-        missing_in_files = db_spawn_ids - file_spawn_ids
-        missing_in_db = file_spawn_ids - db_spawn_ids
+        if args.linx:
+            # Compare using the symlink folder.
+            linx_dir = os.path.join(spawn_root, "aux", "user", "linx")
+            if not os.path.isdir(linx_dir):
+                logger.error(f"Linx directory not found at {linx_dir}")
+                sys.exit(1)
+            symlink_spawn_ids, broken_links = collect_spawn_ids_from_symlinks(linx_dir)
+            missing_ids = db_spawn_ids - symlink_spawn_ids
+            extra_ids = symlink_spawn_ids - db_spawn_ids
 
-        print("\n=== Spawn ID Comparison Report ===")
-        print(f"Total spawn IDs in database ({table_name}): {len(db_spawn_ids)}")
-        print(f"Total spawn IDs found in Music folder: {len(file_spawn_ids)}")
-        if missing_in_files:
-            print("\nSpawn IDs present in DB but not found in files:")
-            for sid in sorted(missing_in_files):
-                print(f"  {sid}")
+            print("\n=== Spawn ID Symlink Comparison Report ===")
+            print(f"Total spawn IDs in database: {len(db_spawn_ids)}")
+            print(f"Total spawn IDs found in symlink folder: {len(symlink_spawn_ids)}")
+            if missing_ids:
+                print("\nSpawn IDs present in the DB but missing in the symlink folder:")
+                for sid in sorted(missing_ids):
+                    print(f"  {sid}")
+            else:
+                print("\nAll Spawn IDs from the database have corresponding symlinks.")
+            if extra_ids:
+                print("\nSpawn IDs found in the symlink folder but not in the DB:")
+                for sid in sorted(extra_ids):
+                    print(f"  {sid}")
+            else:
+                print("\nNo extra Spawn IDs found in the symlink folder.")
+            if broken_links:
+                print("\nSymlinks with broken targets (missing actual file):")
+                for sid in sorted(broken_links):
+                    print(f"  {sid}")
+            else:
+                print("\nAll symlinks point to existing files.")
         else:
-            print("\nAll Spawn IDs from database were found in files.")
+            # Compare using the Music folder.
+            file_spawn_ids = collect_spawn_ids_from_files(music_dir)
+            missing_ids = db_spawn_ids - file_spawn_ids
+            extra_ids = file_spawn_ids - db_spawn_ids
 
-        if missing_in_db:
-            print("\nSpawn IDs found in files but not present in DB:")
-            for sid in sorted(missing_in_db):
-                print(f"  {sid}")
-        else:
-            print("\nAll Spawn IDs from files were found in the database.\n")
-
+            print("\n=== Spawn ID Comparison Report ===")
+            print(f"Total spawn IDs in database ({table_name}): {len(db_spawn_ids)}")
+            print(f"Total spawn IDs found in Music folder: {len(file_spawn_ids)}")
+            if missing_ids:
+                print("\nSpawn IDs present in DB but not found in files:")
+                for sid in sorted(missing_ids):
+                    print(f"  {sid}")
+            else:
+                print("\nAll Spawn IDs from database were found in files.")
+            if extra_ids:
+                print("\nSpawn IDs found in files but not present in DB:")
+                for sid in sorted(extra_ids):
+                    print(f"  {sid}")
+            else:
+                print("\nAll Spawn IDs from files were found in the database.\n")
         sys.exit(0)
 
-    # Otherwise, run the normal mode: create symlinks from Music folder.
+    # Normal mode: Create symlinks from Music folder.
     logger.info(f"Using Spawn library at: {spawn_root}")
     logger.info(f"Looking for tracks under: {music_dir}")
-
     processed_spawn_ids = set()
 
     for root, dirs, files in os.walk(music_dir):
