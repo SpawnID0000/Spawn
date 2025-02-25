@@ -41,6 +41,7 @@ def run_curator_basic(spawn_root: str, is_admin: bool = True):
     BASIC curation approach:
       - Possibly filter by favorites
       - Group tracks by spawnre or ©gen
+      - Optionally merge similar clusters (using embeddings)
       - Shuffle each cluster
       - Write M3U
     """
@@ -98,34 +99,55 @@ def run_curator_basic(spawn_root: str, is_admin: bool = True):
 
     # 3) Group into clusters by 'spawnre' or fallback '©gen'
     clusters = group_tracks_by_genre(all_tracks)
-    if not clusters:
-        print("[INFO] No genre clusters formed. Nothing to do.")
-        return
 
-    # 4) Order the clusters by genre relationships (initial)
+    # 4) Optional: Merge similar clusters based on embeddings
+    merge_choice = input("\nMerge similar clusters based on embeddings? (y/[n]): ").strip().lower()
+    if merge_choice == "y":
+        embeddings_path = os.path.join(spawn_root, "Spawn", "aux", "glob", "mp4tovec.p")
+        if not os.path.isfile(embeddings_path):
+            print(f"[ERROR] Embeddings file not found at: {embeddings_path}. Skipping merge.")
+        else:
+            try:
+                with open(embeddings_path, "rb") as f:
+                    embeddings = pickle.load(f)
+                if not isinstance(embeddings, dict):
+                    raise ValueError("Embeddings file does not contain a dictionary.")
+            except Exception as e:
+                print(f"[ERROR] Failed to load embeddings: {e}. Skipping merge.")
+            else:
+                # Attach embedding to each track (if available)
+                for tracks in clusters.values():
+                    for track in tracks:
+                        sid = track.get("spawn_id")
+                        if sid in embeddings:
+                            track['embedding'] = embeddings[sid]
+                clusters = merge_similar_clusters(clusters, threshold=0.97)
+                print("[INFO] Similar clusters have been merged.")
+
+    # 5) Order the clusters by genre relationships (initial)
     ordered_genres = order_clusters_by_relationships(clusters)
     if not ordered_genres:
         print("[ERROR] Could not order clusters by relationship. Exiting.")
         return
 
-    # 5) Allow user to optionally modify cluster order
+    # 6) Allow user to optionally modify cluster order
     ordered_genres = maybe_modify_cluster_order(ordered_genres, clusters, spawn_root)
 
-    # 6) Basic approach => just shuffle each cluster
+    # 7) Basic approach => just shuffle each cluster
     curated_clusters = []
     for genre in ordered_genres:
         track_list = clusters[genre]
         random.shuffle(track_list)
         curated_clusters.append((genre, track_list))
 
-    # 7) Write M3U
+    # 8) Write M3U
     final_m3u_path = write_curated_m3u(spawn_root, curated_clusters, favorites_filter_desc)
     if final_m3u_path:
         print(f"[INFO] Curated M3U created at: {final_m3u_path}")
     else:
         print("[ERROR] Could not write the curated M3U playlist.")
 
-    # 8) Summaries
+    # 9) Summaries
     print("\n[Summary of curated clusters]:")
     for g, tracks in curated_clusters:
         print(f"  * {g} => {len(tracks)} tracks")
@@ -139,6 +161,7 @@ def run_curator_feature(spawn_root: str, is_admin: bool = True):
     FEATURE-BASED curation approach:
       - Possibly filter by favorites
       - Group tracks by spawnre or ©gen
+      - Optionally merge similar clusters (using embeddings)
       - Reorder each cluster with feature_based_curate
       - Write M3U
     """
@@ -165,7 +188,7 @@ def run_curator_feature(spawn_root: str, is_admin: bool = True):
     if not is_admin:
         all_tracks = [t for t in all_tracks if t.get("spawn_id")]
 
-    # (A) Ask if user wants to filter by favorites
+    # 3) Ask if user wants to filter by favorites
     favorites_filter_desc = None
     only_favorites_ans = input("\nWould you like to only use favorites for the curation? (y/[n]): ").strip().lower()
     if only_favorites_ans == "y":
@@ -192,22 +215,42 @@ def run_curator_feature(spawn_root: str, is_admin: bool = True):
         else:
             print("[WARN] Invalid selection. Proceeding without favorites filtering.")
 
-    # 3) Group by spawnre / ©gen
+    # 4) Group by spawnre / ©gen
     clusters = group_tracks_by_genre(all_tracks)
-    if not clusters:
-        print("[INFO] No genre clusters formed. Nothing to do.")
-        return
 
-    # 4) Order by relationships
+    # 5) Optional: Merge similar clusters based on embeddings
+    merge_choice = input("\nMerge similar clusters based on embeddings? (y/[n]): ").strip().lower()
+    if merge_choice == "y":
+        embeddings_path = os.path.join(spawn_root, "Spawn", "aux", "glob", "mp4tovec.p")
+        if not os.path.isfile(embeddings_path):
+            print(f"[ERROR] Embeddings file not found at: {embeddings_path}. Skipping merge.")
+        else:
+            try:
+                with open(embeddings_path, "rb") as f:
+                    embeddings = pickle.load(f)
+                if not isinstance(embeddings, dict):
+                    raise ValueError("Embeddings file does not contain a dictionary.")
+            except Exception as e:
+                print(f"[ERROR] Failed to load embeddings: {e}. Skipping merge.")
+            else:
+                for tracks in clusters.values():
+                    for track in tracks:
+                        sid = track.get("spawn_id")
+                        if sid in embeddings:
+                            track['embedding'] = embeddings[sid]
+                clusters = merge_similar_clusters(clusters, threshold=0.97)
+                print("[INFO] Similar clusters have been merged.")
+
+    # 6) Order by relationships
     ordered_genres = order_clusters_by_relationships(clusters)
     if not ordered_genres:
         print("[ERROR] Could not order clusters by relationship. Exiting.")
         return
 
-    # 5) Optionally modify cluster order
+    # 7) Optionally modify cluster order
     ordered_genres = maybe_modify_cluster_order(ordered_genres, clusters, spawn_root)
 
-    # 6) Feature-based reorder each cluster
+    # 8) Feature-based reorder each cluster
     curated_clusters = []
     for genre in ordered_genres:
         track_list = clusters[genre]
@@ -215,14 +258,14 @@ def run_curator_feature(spawn_root: str, is_admin: bool = True):
         reordered_list = feature_based_curate(track_list)
         curated_clusters.append((genre, reordered_list))
 
-    # 7) Write M3U
+    # 9) Write M3U
     final_m3u_path = write_curated_m3u(spawn_root, curated_clusters, favorites_filter_desc)
     if final_m3u_path:
         print(f"[INFO] Feature-based M3U created at: {final_m3u_path}")
     else:
         print("[ERROR] Could not write the feature-based M3U playlist.")
 
-    # 8) Summary
+    # 10) Summary
     print("\n[Summary of curated clusters]:")
     for g, tracks in curated_clusters:
         print(f"  * {g} => {len(tracks)} tracks")
@@ -234,11 +277,10 @@ def run_curator_feature(spawn_root: str, is_admin: bool = True):
 
 def run_curator_advanced(spawn_root: str, is_admin: bool = True):
     """
-    Advanced curation approach leveraging embeddings and Deej-AI trained model, with:
+    Advanced curation approach leveraging embeddings and a trained model, with:
       - refined cluster membership (cosine centroid approach),
-      - chain-based approach within each cluster,
-      - bridging across clusters so the next cluster starts with the track
-        closest to the previous cluster's last track.
+      - chain-based ordering within each cluster,
+      - optional merging of similar clusters based on embeddings.
     """
 
     # 1) Determine the database path and table name based on mode.
@@ -305,14 +347,23 @@ def run_curator_advanced(spawn_root: str, is_admin: bool = True):
 
     # 7) Build base clusters (from spawnre/©gen)
     base_clusters = group_tracks_by_genre(all_tracks)
-    if not base_clusters:
-        print("[INFO] No genre clusters formed. Nothing to do.")
-        return
 
-    # 8) Refine cluster membership based on cosine distance to each centroid
+    # 8) Optional: Merge similar clusters based on embeddings
+    merge_choice = input("\nMerge similar clusters based on embeddings? (y/[n]): ").strip().lower()
+    if merge_choice == "y":
+        # Attach embedding to each track (if available)
+        for tracks in base_clusters.values():
+            for track in tracks:
+                sid = track.get("spawn_id")
+                if sid in embeddings:
+                    track['embedding'] = embeddings[sid]
+        base_clusters = merge_similar_clusters(base_clusters, threshold=0.97)
+        print("[INFO] Similar clusters have been merged.")
+
+    # 9) Refine cluster membership based on cosine distance to each centroid
     refined_clusters = refine_clusters_by_embeddings(all_tracks, embeddings, base_clusters, distance_threshold=0.15)
 
-    # 9) Sort clusters, with outliers last
+    # 10) Sort clusters, with outliers last
     all_genre_keys = sorted(g for g in refined_clusters.keys() if g != "outliers")
     if "outliers" in refined_clusters:
         all_genre_keys.append("outliers")
@@ -320,7 +371,7 @@ def run_curator_advanced(spawn_root: str, is_admin: bool = True):
     curated_clusters = []
     last_track_embedding = None
 
-    # 10) Chain-based ordering within each cluster, bridging from previous cluster
+    # 11) Chain-based ordering within each cluster, bridging from previous cluster
     for genre in all_genre_keys:
         track_list = refined_clusters[genre]
         chain_ordered = chain_based_curation(track_list, embeddings, last_track_embedding)
@@ -335,19 +386,19 @@ def run_curator_advanced(spawn_root: str, is_admin: bool = True):
             else:
                 last_track_embedding = None
 
-    # 11) Write M3U
+    # 12) Write M3U
     final_m3u_path = write_curated_m3u(spawn_root, curated_clusters, favorites_filter_desc)
     if final_m3u_path:
         print(f"[INFO] Advanced curated M3U created at: {final_m3u_path}")
     else:
         print("[ERROR] Could not write the advanced curated M3U playlist.")
 
-    # 12) Summary
+    # 13) Summary
     print("\n[Summary of refined clusters]:")
     for g, tracks in curated_clusters:
         print(f"  * {g} => {len(tracks)} tracks")
 
-    # 13) Recommendations playlist
+    # 14) Recommendations playlist
     recs_ans = input("\nWould you also like to generate a curated playlist of other tracks you might like? ([y]/n): ").strip().lower()
     if recs_ans in ["", "y"]:
         from .likey import generate_recommended_playlist
@@ -818,18 +869,55 @@ def group_tracks_by_genre(all_tracks: List[dict]) -> Dict[str, List[dict]]:
     """
     clusters = defaultdict(list)
     for track_info in all_tracks:
-        # Prefer spawnre
-        spawnre_val = safe_extract_first(track_info, "----:com.apple.iTunes:spawnre")
-        if spawnre_val:
-            g = spawnre_val.lower()
+        # Prefer spawnre_hex for normalized, standardized genre codes
+        spawnre_hex_val = safe_extract_first(track_info, "----:com.apple.iTunes:spawnre_hex")
+        if spawnre_hex_val:
+            g = spawnre_hex_val.lower()
         else:
-            # fallback to ©gen
-            fallback_gen = safe_extract_first(track_info, "©gen")
+            # fallback to the genre tag
+            fallback_gen = safe_extract_first(track_info, "genre")
             g = fallback_gen.lower() if fallback_gen else "unknown"
-
         clusters[g].append(track_info)
-
     return dict(clusters)
+
+
+def merge_similar_clusters(clusters, threshold=0.97):
+    """
+    clusters: dict mapping cluster_id to list of track dictionaries.
+              Each track is expected to have an 'embedding' key.
+    threshold: cosine similarity threshold above which clusters are merged.
+    """
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    # Compute centroids for each cluster
+    centroids = {
+        cid: np.mean([track['embedding'] for track in tracks if 'embedding' in track], axis=0)
+        for cid, tracks in clusters.items()
+    }
+    
+    labels = list(centroids.keys())
+    merged_clusters = {}
+    merged = set()
+    
+    for i, label_i in enumerate(labels):
+        if label_i in merged:
+            continue
+        # Start with current cluster
+        current_cluster = clusters[label_i][:]
+        centroid_i = centroids[label_i]
+        
+        for j in range(i + 1, len(labels)):
+            label_j = labels[j]
+            if label_j in merged:
+                continue
+            centroid_j = centroids[label_j]
+            sim = cosine_similarity(centroid_i.reshape(1, -1), centroid_j.reshape(1, -1))[0][0]
+            if sim > threshold:
+                current_cluster.extend(clusters[label_j])
+                merged.add(label_j)
+        merged_clusters[label_i] = current_cluster
+    
+    return merged_clusters
 
 
 def safe_extract_first(tag_dict: dict, key: str) -> Optional[str]:
