@@ -4,20 +4,24 @@
 
 ## Table of Contents
 
-- [Features](#features)
-- [Installation](#installation)
-  - [System Requirements](#system-requirements)
-  - [Python Dependencies](#python-dependencies)
-- [Library Directory Structure](#library-directory-structure)
-- [Usage](#usage)
-  - [1. Import Tracks](#1-import-tracks)
-  - [2. Update Favorites](#2-update-favorites)
-  - [3. Create Curated Playlist](#3-create-curated-playlist)
-  - [4. Play M3U Playlist](#4-play-m3u-playlist)
-- [Modules Overview](#modules-overview)
-- [Additional Configuration](#additional-configuration)
-- [License](#license)
-- [Contributing](#contributing)
+- [Spawn](#spawn)
+  - [Table of Contents](#table-of-contents)
+  - [Features](#features)
+  - [Installation](#installation)
+    - [System Requirements](#system-requirements)
+    - [Python Dependencies](#python-dependencies)
+    - [Before Running Spawn](#before-running-spawn)
+      - [If you have Python \>= 3.13](#if-you-have-python--313)
+  - [Library Directory Structure](#library-directory-structure)
+  - [Usage](#usage)
+    - [1. Import Tracks](#1-import-tracks)
+    - [2. Update Favorites](#2-update-favorites)
+    - [3. Create Curated Playlist](#3-create-curated-playlist)
+    - [4. Play M3U Playlist](#4-play-m3u-playlist)
+  - [Modules Overview](#modules-overview)
+  - [Additional Configuration](#additional-configuration)
+  - [License](#license)
+  - [Contributing](#contributing)
 
 ---
 
@@ -104,6 +108,21 @@ Dependencies include:
 - …and others listed in requirements.txt.
 
 ---
+
+### Before Running Spawn
+
+- Make sure to have `git lfs` in your system. [Installation Steps](https://docs.github.com/en/repositories/working-with-files/managing-large-files/installing-git-large-file-storage)
+- Run `git lfs install` if you have not already.
+- Run `git lfs pull`.
+- Now the `diffusion_pytorch_model.safetensors` should be the actual file instead of the Git LFS pointer file.
+
+#### If you have Python >= 3.13
+
+- In Python 3.13, some modules like `aifc` and `sunau` have been removed. These modules are used in generating the embeddings. As a workaround, please run this:
+
+```bash
+pip install standard-aifc standard-sunau
+```
 
 ## Library Directory Structure
 
