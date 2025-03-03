@@ -32,6 +32,41 @@ from .dic_spawnre import genre_mapping, subgenre_to_parent, genre_synonyms
 logger = logging.getLogger(__name__)
 
 
+def decode_spawnre_hex(spawnre_hex: str) -> str:
+    """
+    Given a spawnre_hex value like 'x011500', parse it into pairs ('01','15','00'),
+    look each up in genre_mapping to get the Genre name(s), and return a comma-
+    separated string like 'classic rock, blues rock, rock'.
+    """
+    # Remove leading "x" if present
+    if spawnre_hex.startswith("x"):
+        spawnre_hex = spawnre_hex[1:]  # e.g. "011500"
+
+    # Split into pairs of 2 hex chars
+    pairs = [spawnre_hex[i:i+2] for i in range(0, len(spawnre_hex), 2)]
+    # Example: "011500" => ["01", "15", "00"]
+
+    decoded_genres = []
+    for pair in pairs:
+        # Turn "01" into "0x01"
+        hex_val = f"0x{pair.lower()}"
+        
+        # Search genre_mapping for an entry where info["Hex"] == hex_val
+        found_genre = None
+        for code_key, info in genre_mapping.items():
+            if info.get("Hex", "").lower() == hex_val:
+                found_genre = info.get("Genre", "Unknown")
+                break
+        
+        if found_genre:
+            decoded_genres.append(found_genre)
+        else:
+            # If nothing matches, optionally store a placeholder
+            decoded_genres.append(f"Unknown({hex_val})")
+    
+    # Join them with commas
+    return ", ".join(decoded_genres)
+
 ###############################################################################
 # BASIC CURATION
 ###############################################################################
@@ -64,12 +99,20 @@ def run_curator_basic(spawn_root: str, is_admin: bool = True):
         print("[INFO] No tracks found in the database. Nothing to curate.")
         return
 
+    # Filter tracks to only include those with valid audio files
+    filter_existing_files = True  # Set to False to disable filtering by file existence (i.e. to test curation of all catalog tracks)
+    if filter_existing_files:
+        original_count = len(all_tracks)
+        all_tracks = [t for t in all_tracks if track_file_exists(t, spawn_root)]
+        print(f"[INFO] Filtered tracks by file existence: {original_count} -> {len(all_tracks)}")
+
     # In user mode, only keep tracks that have a Spawn ID.
     if not is_admin:
         all_tracks = [t for t in all_tracks if t.get("spawn_id")]
 
     # Ask if user wants to filter by favorites
     favorites_filter_desc = None
+    suffix = ""
     only_favorites_ans = input("\nWould you like to only use favorites for the curation? (y/[n]): ").strip().lower()
     if only_favorites_ans == "y":
         # Prompt user: which favorite set?
@@ -93,6 +136,7 @@ def run_curator_basic(spawn_root: str, is_admin: bool = True):
                 favorites_filter_desc = "favorite tracks"
             elif fav_choice == "4":
                 favorites_filter_desc = "favorite artists & favorite tracks"
+            suffix = "_favs"  # Append _favs to the M3U filename
         else:
             print("[WARN] Invalid selection. Proceeding without favorites filtering.")
 
@@ -141,7 +185,7 @@ def run_curator_basic(spawn_root: str, is_admin: bool = True):
         curated_clusters.append((genre, track_list))
 
     # 8) Write M3U
-    final_m3u_path = write_curated_m3u(spawn_root, curated_clusters, favorites_filter_desc)
+    final_m3u_path = write_curated_m3u(spawn_root, curated_clusters, favorites_filter_desc, suffix)
     if final_m3u_path:
         print(f"[INFO] Curated M3U created at: {final_m3u_path}")
     else:
@@ -184,12 +228,20 @@ def run_curator_feature(spawn_root: str, is_admin: bool = True):
         print("[INFO] No tracks found in the database. Nothing to curate.")
         return
 
+    # Filter tracks to only include those with valid audio files
+    filter_existing_files = True  # Set to False to disable filtering by file existence (i.e. to test curation of all catalog tracks)
+    if filter_existing_files:
+        original_count = len(all_tracks)
+        all_tracks = [t for t in all_tracks if track_file_exists(t, spawn_root)]
+        print(f"[INFO] Filtered tracks by file existence: {original_count} -> {len(all_tracks)}")
+
     # In user mode, only include tracks with a valid Spawn ID.
     if not is_admin:
         all_tracks = [t for t in all_tracks if t.get("spawn_id")]
 
     # 3) Ask if user wants to filter by favorites
     favorites_filter_desc = None
+    suffix = ""
     only_favorites_ans = input("\nWould you like to only use favorites for the curation? (y/[n]): ").strip().lower()
     if only_favorites_ans == "y":
         print("\nWhich would you like to include in the curated playlist?")
@@ -212,6 +264,7 @@ def run_curator_feature(spawn_root: str, is_admin: bool = True):
                 favorites_filter_desc = "favorite tracks"
             elif fav_choice == "4":
                 favorites_filter_desc = "favorite artists & favorite tracks"
+            suffix = "_favs"  # Append _favs to the M3U filename
         else:
             print("[WARN] Invalid selection. Proceeding without favorites filtering.")
 
@@ -259,7 +312,7 @@ def run_curator_feature(spawn_root: str, is_admin: bool = True):
         curated_clusters.append((genre, reordered_list))
 
     # 9) Write M3U
-    final_m3u_path = write_curated_m3u(spawn_root, curated_clusters, favorites_filter_desc)
+    final_m3u_path = write_curated_m3u(spawn_root, curated_clusters, favorites_filter_desc, suffix)
     if final_m3u_path:
         print(f"[INFO] Feature-based M3U created at: {final_m3u_path}")
     else:
@@ -280,6 +333,7 @@ def run_curator_advanced(spawn_root: str, is_admin: bool = True):
     Advanced curation approach leveraging embeddings and a trained model, with:
       - refined cluster membership (cosine centroid approach),
       - chain-based ordering within each cluster,
+      - optional favorites filtering,
       - optional merging of similar clusters based on embeddings.
     """
 
@@ -317,6 +371,13 @@ def run_curator_advanced(spawn_root: str, is_admin: bool = True):
         print("[INFO] No tracks found in the database. Nothing to curate.")
         return
 
+    # Filter tracks to only include those with valid audio files
+    filter_existing_files = True  # Set to False to disable filtering by file existence (i.e. to test curation of all catalog tracks)
+    if filter_existing_files:
+        original_count = len(all_tracks)
+        all_tracks = [t for t in all_tracks if track_file_exists(t, spawn_root)]
+        print(f"[INFO] Filtered tracks by file existence: {original_count} -> {len(all_tracks)}")
+
     # In user mode, only include tracks with a valid Spawn ID.
     if not is_admin:
         all_tracks = [t for t in all_tracks if t.get("spawn_id")]
@@ -337,13 +398,32 @@ def run_curator_advanced(spawn_root: str, is_admin: bool = True):
 
     # 6) Optionally filter tracks by favorites
     favorites_filter_desc = None
+    suffix = ""
     only_favorites_ans = input("\nWould you like to only use favorites for advanced curation? (y/[n]): ").strip().lower()
     if only_favorites_ans == "y":
-        all_tracks = filter_tracks_by_favorites(all_tracks, spawn_root, "4")  # e.g. "favorite artists & tracks"
-        if not all_tracks:
-            print("[INFO] No tracks remain after applying favorites filter. Aborting.")
-            return
-        favorites_filter_desc = "favorite artists & favorite tracks"
+        print("\nWhich would you like to include in the curated playlist?")
+        print("    1. favorite artists")
+        print("    2. favorite albums")
+        print("    3. favorite tracks")
+        print("    4. favorite artists & favorite tracks")
+        fav_choice = input("Enter your selection: ").strip()
+
+        if fav_choice in ["1", "2", "3", "4"]:
+            all_tracks = filter_tracks_by_favorites(all_tracks, spawn_root, fav_choice)
+            if not all_tracks:
+                print("[INFO] No tracks remain after applying favorites filter. Aborting.")
+                return
+            if fav_choice == "1":
+                favorites_filter_desc = "favorite artists"
+            elif fav_choice == "2":
+                favorites_filter_desc = "favorite albums"
+            elif fav_choice == "3":
+                favorites_filter_desc = "favorite tracks"
+            elif fav_choice == "4":
+                favorites_filter_desc = "favorite artists & favorite tracks"
+            suffix = "_favs"  # Append _favs to the M3U filename
+        else:
+            print("[WARN] Invalid selection. Proceeding without favorites filtering.")
 
     # 7) Build base clusters (from spawnre/©gen)
     base_clusters = group_tracks_by_genre(all_tracks)
@@ -387,7 +467,7 @@ def run_curator_advanced(spawn_root: str, is_admin: bool = True):
                 last_track_embedding = None
 
     # 12) Write M3U
-    final_m3u_path = write_curated_m3u(spawn_root, curated_clusters, favorites_filter_desc)
+    final_m3u_path = write_curated_m3u(spawn_root, curated_clusters, favorites_filter_desc, suffix)
     if final_m3u_path:
         print(f"[INFO] Advanced curated M3U created at: {final_m3u_path}")
     else:
@@ -396,7 +476,13 @@ def run_curator_advanced(spawn_root: str, is_admin: bool = True):
     # 13) Summary
     print("\n[Summary of refined clusters]:")
     for g, tracks in curated_clusters:
-        print(f"  * {g} => {len(tracks)} tracks")
+        print(f"\n  * {g} => {len(tracks)} tracks")
+
+        # If this g looks like 'x...' => decode it into genres
+        if g.startswith("x"):
+            decoded = decode_spawnre_hex(g)
+            # Print them with some indentation
+            print(f"    {decoded}")
 
     # 14) Recommendations playlist
     recs_ans = input("\nWould you also like to generate a curated playlist of other tracks you might like? ([y]/n): ").strip().lower()
@@ -1312,8 +1398,18 @@ def write_curated_m3u(
 
             f.write("\n")
 
-            for (genre_name, track_list) in curated_clusters:
-                f.write(f"# GENRE: {genre_name}\n")
+            for (genre_key, track_list) in curated_clusters:
+                # If the key starts with 'x', it's a spawnre_hex, so decode it
+                if genre_key.startswith("x"):
+                    # Write raw hex, then the decoded genres
+                    f.write(f"# SPAWNRE_HEX: {genre_key}\n")
+                    decoded = decode_spawnre_hex(genre_key)
+                    f.write(f"# GENRES: {decoded}\n")
+                else:
+                    # Otherwise just label it as "GENRE:"
+                    f.write(f"# GENRE: {genre_key}\n")
+
+                # Then list the tracks
                 for track_info in track_list:
                     rel_path = build_relative_path(track_info, prefix)
                     f.write(f"{rel_path}\n")
@@ -1323,6 +1419,48 @@ def write_curated_m3u(
     except Exception as e:
         logger.error(f"Error writing curated M3U => {e}")
         return None
+
+
+def track_file_exists(track_info: dict, spawn_root: str) -> bool:
+    """
+    Returns True if the audio file for the track exists in the Music directory.
+    Uses similar logic to build_relative_path(), but constructs an absolute path.
+    """
+    import os
+    # Define the absolute Music directory (assumes Music folder is under spawn_root)
+    music_dir = os.path.join(spawn_root, "Music")
+    
+    artist = safe_extract_first(track_info, "©ART") or "Unknown"
+    album  = safe_extract_first(track_info, "©alb") or "Unknown"
+    title  = safe_extract_first(track_info, "©nam") or "Untitled"
+    spawn_id = track_info.get("spawn_id", "unknown")
+    
+    # Extract disc and track numbers (with safe fallbacks)
+    disc_tag = track_info.get("disk")
+    track_tag = track_info.get("trkn")
+    disc_main = 1
+    if disc_tag and isinstance(disc_tag, list) and disc_tag:
+        try:
+            disc_main = int(disc_tag[0][0])
+        except Exception:
+            pass
+    track_main = 0
+    if track_tag and isinstance(track_tag, list) and track_tag:
+        try:
+            track_main = int(track_tag[0][0])
+        except Exception:
+            pass
+
+    # Build the file name using the same helper as before
+    file_name = build_d_tt_spawn_id_title_filename(disc_main, track_main, spawn_id, title)
+    
+    # Sanitize artist and album as done in build_relative_path
+    artist_dir = sanitize_for_directory(artist)
+    album_dir = sanitize_for_directory(album)
+    
+    # Build the absolute path to the audio file
+    abs_path = os.path.join(music_dir, artist_dir, album_dir, file_name)
+    return os.path.isfile(abs_path)
 
 
 def build_relative_path(track_tags: dict, prefix: str) -> str:

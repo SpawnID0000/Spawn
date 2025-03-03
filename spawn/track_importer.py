@@ -1433,10 +1433,10 @@ def find_closest_genre_matches(genres: list, genre_mapping: dict) -> (list, str)
                 matched_genres.append(details["Genre"])  # official name
                 break
 
-        if len(spawnre_hex) >= 10:
+        if len(spawnre_hex) >= 11:
             break
 
-    spawnre_hex = spawnre_hex[:10]
+    spawnre_hex = spawnre_hex[:11]      # 11 digits for "x##########", i.e. 5 genres
     return matched_genres, spawnre_hex
 
 
@@ -2037,14 +2037,31 @@ def rewrite_tags(file_path, tags):
 
     for tag, value in tags.items():
         if tag.startswith("----:com.apple.iTunes:"):
-
-            # (A) If we want a multi-value list:
-            if tag in MULTI_VALUE_FREEFORM:
-                # Convert `value` to a *list of strings* in Python memory
-
-                # Step 1: If `value` is already a list, interpret each item.
-                #         Otherwise, treat it as a single string to be split or used directly.
+            # Special handling for MusicBrainz freeform tags:
+            if "MusicBrainz" in tag:
+                # Get a single string value (similar to branch B below)
                 if isinstance(value, list):
+                    val = value[0] if value else ""
+                else:
+                    val = value
+
+                if isinstance(val, bytes):
+                    val_str = val.decode("utf-8", errors="replace")
+                else:
+                    val_str = str(val)
+
+                # Create a freeform atom with the proper structure.
+                freeform = MP4FreeForm(val_str.encode("utf-8", errors="replace"), dataformat=0)
+                freeform.mean = "com.apple.iTunes"
+                # Set the freeform name to the part after "----:com.apple.iTunes:"
+                freeform.name = tag.replace("----:com.apple.iTunes:", "")
+                audio.tags[tag] = [freeform]
+
+            # (A) Multi-value freeform tags:
+            elif tag in MULTI_VALUE_FREEFORM:
+                # Convert `value` to a list of strings
+                if isinstance(value, list):
+
                     # We might already have something like [b'pop', b'rock', b'electronic']
                     # Decode them into Python strings
                     str_list = []
@@ -2060,8 +2077,7 @@ def rewrite_tags(file_path, tags):
                     else:
                         decoded = str(value)
 
-                    # If you want to split by comma => e.g. "pop,rock" => ["pop","rock"]
-                    # you can do so:
+                    # Split by comma if desired
                     str_list = [v.strip() for v in decoded.split(",")]
 
                 # Step 2: Store it as a list of bytes
@@ -2335,19 +2351,25 @@ def confirm_or_update_tags(temp_tags, file_path):
             spawn_id = spawn_id.decode("utf-8", errors="replace")
         spawn_id = str(spawn_id).strip()
         db_entry = fetch_tags_from_db(spawn_id)
-        if db_entry:
-            logger.info(f"[confirm_or_update_tags] Found database entry for spawn_id {spawn_id}; using catalog metadata instead of API lookups.")
-            for key in ["----:com.apple.iTunes:MusicBrainz Artist Id",
-                        "----:com.apple.iTunes:MusicBrainz Track Id",
-                        "----:com.apple.iTunes:MusicBrainz Release Group Id",
+        # Define the MBID keys we care about.
+        mb_keys = [
+            "----:com.apple.iTunes:MusicBrainz Artist Id",
+            "----:com.apple.iTunes:MusicBrainz Track Id",
+            "----:com.apple.iTunes:MusicBrainz Release Group Id"
+        ]
+        # Only override if all MBID keys are present and valid.
+        if db_entry and all(db_entry.get(key) not in [None, "", "N/A"] for key in mb_keys):
+            logger.info(f"[confirm_or_update_tags] Found complete MBID data in DB for spawn_id {spawn_id}; using catalog metadata for MusicBrainz fields.")
+            for key in mb_keys + [
                         "----:com.apple.iTunes:spawnre",
                         "----:com.apple.iTunes:spawnre_hex",
                         "©gen"]:
                 if key in db_entry:
                     temp_tags[key] = db_entry[key]
                     logger.info(f"[confirm_or_update_tags] Set {key} to: {db_entry[key]}")
-            # Proceed with AcoustID and Spotify confirmation as before.
+            # Proceed with AcoustID confirmation or update
             generate_and_update_acoustid(file_path, temp_tags)
+            # Proceed with Spotify confirmation or update
             confirm_or_update_spotify(temp_tags, file_path)
             logger.info("\n\n                           Completed check of MBID, AcoustID, & Spotify ID. Rewriting updated tags...\n")
             rewrite_tags(file_path, temp_tags)
@@ -2465,6 +2487,28 @@ def confirm_or_update_spotify(temp_tags, file_path):
     """
 
     logger.debug("Confirming or updating Spotify IDs")
+
+    # Check database for valid Spotify IDs before doing API lookups
+    spawn_id = temp_tags.get("----:com.apple.iTunes:spawn_ID")
+    if spawn_id:
+        if isinstance(spawn_id, list) and spawn_id:
+            spawn_id = spawn_id[0]
+        if isinstance(spawn_id, bytes):
+            spawn_id = spawn_id.decode("utf-8", errors="replace")
+        spawn_id = str(spawn_id).strip()
+        db_entry = fetch_tags_from_db(spawn_id)
+        spotify_keys = [
+            "----:com.apple.iTunes:spotify_artist_ID",
+            "----:com.apple.iTunes:spotify_track_ID"
+        ]
+        # Only use database Spotify data if both keys exist and are not empty
+        if db_entry and all(db_entry.get(key) not in [None, "", "N/A"] for key in spotify_keys):
+            logger.info(f"[confirm_or_update_spotify] Found complete Spotify metadata in DB for spawn_id {spawn_id}; using catalog metadata.")
+            for key in spotify_keys:
+                temp_tags[key] = db_entry[key]
+                logger.info(f"[confirm_or_update_spotify] Set {key} to: {db_entry[key]}")
+            # Since database values are valid, skip further API confirmation.
+            return
 
     track_id_key = "----:com.apple.iTunes:spotify_track_ID"
     artist_id_key = "----:com.apple.iTunes:spotify_artist_ID"

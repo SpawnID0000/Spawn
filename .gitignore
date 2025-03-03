@@ -1,8 +1,9 @@
 # ===============================
 # 🚫 Ignore API Credentials
 # ===============================
-# Prevent committing API keys and sensitive configuration files.
+# Prevent committing API keys and configuration files.
 APIds.env
+settings.env
 
 # ===============================
 # 📁 Ignore Cache Directories
