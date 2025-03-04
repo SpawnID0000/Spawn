@@ -2,8 +2,8 @@
 # 🚫 Ignore API Credentials
 # ===============================
 # Prevent committing API keys and configuration files.
-APIds.env
-settings.env
+spawn/APIds.env
+spawn/settings.env
 
 # ===============================
 # 📁 Ignore Cache Directories

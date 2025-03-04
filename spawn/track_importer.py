@@ -97,6 +97,9 @@ from spawn.MP4ToVec import load_mp4tovec_model_diffusion, generate_embedding
 #from spawn.MP4ToVec import load_mp4tovec_model_torch, generate_embedding
 #from spawn.MP4ToVec import load_mp4tovec_model_tf, generate_embedding
 
+from spawn.albmaker import generate_album_playlists
+from spawn.albmaker import generate_playlist_for_album
+
 # Use Hugging Face's built-in logging controls:
 try:
     import huggingface_hub.utils.logging as hf_logging
@@ -130,7 +133,8 @@ DEBUG_MODE = False
 SKIP_PROMPTS = False
 
 # Create a global logger object at the module level
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("spawn")
+#logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)  # Capture everything in the logger
 
 spawn_id_to_embeds = {}
@@ -3975,6 +3979,14 @@ def process_audio_files(
         parent_folder = os.path.abspath(os.path.dirname(f))
         folder_map[parent_folder].append(f)
 
+    # Compute auxiliary directories once from OUTPUT_PARENT_DIR.
+    # OUTPUT_PARENT_DIR is set to LIB_PATH/Spawn/Music
+    lib_base = os.path.dirname(os.path.dirname(OUTPUT_PARENT_DIR))  # gets LIB_PATH
+    spawn_root = os.path.join(lib_base, "Spawn")
+    user_aux_dir = os.path.join(spawn_root, "aux", "user")
+    alb_dir = os.path.join(user_aux_dir, "albm")    # Directory for album M3U playlists
+    linx_dir = os.path.join(user_aux_dir, "linx")     # Directory for symlinks
+
     # Keep a list of (file_path, temp_tags) so that after finalize_spawnre_tags(),
     # 'spawnre_tag' can be assigned to each track, then rename files.
     all_tracks = []
@@ -4469,7 +4481,7 @@ def process_audio_files(
             cleaned_files_map[target_file] = temp_tags
             all_tracks.append((target_file, temp_tags))
 
-        # After processing all tracks in this folder, handle album-level RG and album art
+        # After processing all tracks in this folder, handle album-level ReplayGain and album art
         if cleaned_files_map:
             run_replaygain_on_folder(cleaned_files_map)
 
@@ -4498,7 +4510,7 @@ def process_audio_files(
             artist_dir = sanitize_for_directory(artist_name)
             album_dir  = sanitize_for_directory(album_name)
 
-            # 2) Construct the exact final folder
+            # 2) Construct the exact final output folder
             final_album_dir = os.path.join(OUTPUT_PARENT_DIR, artist_dir, album_dir)
             os.makedirs(final_album_dir, exist_ok=True)
 
@@ -4847,6 +4859,20 @@ def process_audio_files(
             create_symlink_for_track(track_path, lib_base, spawn_id_str)
         else:
             logger.warning(f"No spawn_id found for track {track_path}; skipping symlink creation.")
+
+    # Generate album M3U playlists for newly imported album folders
+    logger.info("\nGenerating album M3U playlists for newly imported albums...")
+    new_album_folders = set()
+    for (track_path, track_tags) in all_tracks:
+        if track_tags is None:
+            continue
+        # Determine the album folder from the track_path.
+        album_folder = os.path.dirname(track_path)
+        new_album_folders.add(album_folder)
+    
+    for album_folder in new_album_folders:
+        logger.info(f"Generating playlist for album folder: {album_folder}")
+        generate_playlist_for_album(album_folder, linx_dir, alb_dir, use_absolute_paths=False)
 
     # M3U generation
     logger.info("=== Creating M3U playlist of newly imported tracks that aren't already in spawn_catalog.db ===")
