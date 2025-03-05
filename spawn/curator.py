@@ -9,6 +9,7 @@ import random
 import re
 import math
 import time
+import unicodedata
 #import librosa
 import pickle
 import numpy as np
@@ -103,7 +104,13 @@ def run_curator_basic(spawn_root: str, is_admin: bool = True):
     filter_existing_files = True  # Set to False to disable filtering by file existence (i.e. to test curation of all catalog tracks)
     if filter_existing_files:
         original_count = len(all_tracks)
-        all_tracks = [t for t in all_tracks if track_file_exists(t, spawn_root)]
+        valid_tracks = []
+        for t in all_tracks:
+            actual_path = track_file_exists(t, spawn_root)
+            if actual_path:
+                t["file_path"] = actual_path  # Store the actual file path in the track info
+                valid_tracks.append(t)
+        all_tracks = valid_tracks
         print(f"[INFO] Filtered tracks by file existence: {original_count} -> {len(all_tracks)}")
 
     # In user mode, only keep tracks that have a Spawn ID.
@@ -1412,7 +1419,13 @@ def write_curated_m3u(
                 # Then list the tracks
                 for track_info in track_list:
                     rel_path = build_relative_path(track_info, prefix)
-                    f.write(f"{rel_path}\n")
+                    actual_path = track_file_exists(track_info, spawn_root)
+                    if actual_path:
+                        rel_path = os.path.relpath(actual_path, start=os.path.join(spawn_root, "Spawn", "Playlists"))
+                        f.write(f"{rel_path}\n")
+                    else:
+                        print(f"[WARNING] Track not found for M3U: {track_info.get('©nam', 'Unknown')}")
+
                 f.write("\n")
 
         return m3u_path
@@ -1421,14 +1434,30 @@ def write_curated_m3u(
         return None
 
 
-def track_file_exists(track_info: dict, spawn_root: str) -> bool:
+def sanitize_for_directory_ascii(name: str, max_len: int = 50) -> str:
     """
-    Returns True if the audio file for the track exists in the Music directory.
-    Uses similar logic to build_relative_path(), but constructs an absolute path.
+    Replaces or removes problematic characters (and truncates if needed) so 'name' can be used as a folder.
+    Uses ASCII-only sanitization to handle special characters.
     """
-    import os
-    # Define the absolute Music directory (assumes Music folder is under spawn_root)
-    music_dir = os.path.join(spawn_root, "Music")
+    # Normalize to NFKD and encode to ASCII, ignoring non-ASCII characters
+    normalized = unicodedata.normalize('NFKD', name).encode('ASCII', 'ignore').decode('utf-8')
+    # Replace problematic punctuation with underscores
+    sanitized = re.sub(r'[\\/:*?"<>|]', '_', normalized.strip())
+    # Truncate if too long
+    if len(sanitized) > max_len:
+        sanitized = sanitized[:max_len].rstrip("_- ")
+    return sanitized or "Unknown"
+
+
+def track_file_exists(track_info: dict, spawn_root: str) -> Optional[str]:
+    """
+    Checks if the audio file for the track exists in the Music directory.
+    Returns the actual path if found, otherwise None.
+    Attempts to handle special characters by retrying with sanitized paths.
+    """
+
+    # Define the absolute Music directory (assumes spawn_root/Spawn/Music)
+    music_dir = os.path.join(spawn_root, "Spawn", "Music")
     
     artist = safe_extract_first(track_info, "©ART") or "Unknown"
     album  = safe_extract_first(track_info, "©alb") or "Unknown"
@@ -1460,7 +1489,25 @@ def track_file_exists(track_info: dict, spawn_root: str) -> bool:
     
     # Build the absolute path to the audio file
     abs_path = os.path.join(music_dir, artist_dir, album_dir, file_name)
-    return os.path.isfile(abs_path)
+
+    # First try with the original path
+    if os.path.isfile(abs_path):
+        return abs_path
+
+    # If not found, try with sanitized names
+    sanitized_artist = sanitize_for_directory_ascii(artist)
+    sanitized_album = sanitize_for_directory_ascii(album)
+    sanitized_title = sanitize_for_directory_ascii(title)
+    sanitized_file_name = build_d_tt_spawn_id_title_filename(disc_main, track_main, spawn_id, sanitized_title)
+    
+    sanitized_path = os.path.join(music_dir, sanitized_artist, sanitized_album, sanitized_file_name)
+    if os.path.isfile(sanitized_path):
+        return sanitized_path
+
+    # If still not found, log a warning with both attempted paths
+    print(f"[WARNING] File not found: {abs_path}")
+    print(f"[WARNING] Retried with sanitized path: {sanitized_path}")
+    return None
 
 
 def build_relative_path(track_tags: dict, prefix: str) -> str:
@@ -1469,10 +1516,15 @@ def build_relative_path(track_tags: dict, prefix: str) -> str:
     ../../Music/Artist/Album/D-TT [spawn_id] - Title.m4a
     """
 
+    actual_path = track_tags.get("file_path")
+    if actual_path:
+        return os.path.relpath(actual_path, start=prefix)
+
+    # Fallback if the actual path is not stored
     artist_raw = safe_extract_first(track_tags, "©ART") or "Unknown"
     album_raw  = safe_extract_first(track_tags, "©alb") or "Unknown"
-    disc_tag   = track_tags.get("disk")  # typically [(disc_main, total)]
-    track_tag  = track_tags.get("trkn")  # typically [(track_main, total)]
+    disc_tag   = track_tags.get("disk")
+    track_tag  = track_tags.get("trkn")
     title_raw  = safe_extract_first(track_tags, "©nam") or "Untitled"
     spawn_id   = track_tags.get("spawn_id", "unknown")
 

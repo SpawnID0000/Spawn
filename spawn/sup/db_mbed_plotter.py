@@ -28,8 +28,11 @@ import logging
 import torch
 import mplcursors
 import random
+import re
 
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
 from matplotlib.widgets import TextBox
 from matplotlib.collections import PathCollection
 from sklearn.manifold import TSNE
@@ -37,6 +40,7 @@ from fuzzywuzzy import fuzz
 
 logger = logging.getLogger(__name__)
 
+current_m3u_indices = None
 
 def load_embeddings(glob_dir: str):
     """
@@ -163,18 +167,186 @@ def normalize_name(name: str) -> str:
     return name
 
 
+def find_spawn_id_for_file(file_path: str, valid_tracks):
+    """
+    Given a file path (from an M3U file), attempts to find the matching spawn_id from the valid_tracks.
+    If the filename contains a pattern "[XXXXXXXX]" where X is an alphanumeric hex digit,
+    that value is used as the spawn_id.
+    Otherwise, it first checks for an exact match using the file basename (without extension).
+    If no exact match is found, it falls back to fuzzy matching on the spawn_id field.
+    Returns the matched spawn_id (string) or None if no good match is found.
+    """
+    base = os.path.basename(file_path)
+
+    # Try to extract a spawn id from pattern "[XXXXXXXX]"
+    hex_match = re.search(r'\[([0-9A-Fa-f]{8})\]', base)
+    if hex_match:
+        return hex_match.group(1)
+    
+    # No explicit spawn id in filename; use the basename (without extension)
+    name, ext = os.path.splitext(base)
+    # Try direct exact match
+    for track in valid_tracks:
+        if track.get("spawn_id", "").lower() == name.lower():
+            return track.get("spawn_id", "")
+    # Fuzzy matching fallback
+    best_ratio = 0
+    best_spawn_id = None
+    for track in valid_tracks:
+        spawn_id = track.get("spawn_id", "")
+        ratio = fuzz.ratio(name.lower(), spawn_id.lower())
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_spawn_id = spawn_id
+    # Return match if ratio is high enough
+    if best_ratio > 70:
+        return best_spawn_id
+    return None
+
+
+def process_m3u_command(text, coords, valid_tracks, scatter, fig, ax, original_colors):
+    """
+    Processes the "@m3u" command from the search box.
+    Expected syntax:
+         @m3u [/path/to/playlist.m3u]
+         or with an index: @m3u-<index> [/path/to/playlist.m3u]
+    It loads the M3U file, takes 20 tracks starting at the given index (default is first track),
+    maps the file names to spawn_ids (using find_spawn_id_for_file), highlights those points,
+    and draws lines connecting them in playlist order. The connecting line segments transition
+    through a custom color gradient.
+    """
+
+    # Pattern to extract an optional index and the file path (preserving original case for the file path)
+    pattern = r'@m3u(?:-(\d+))?\s+(.+)'
+    m = re.search(pattern, text)
+    if not m:
+        print("Invalid @m3u command format. Expected '@m3u [playlist_path]' or '@m3u-<index> [playlist_path]'.")
+        return
+
+    start_index_str = m.group(1)
+    m3u_path = m.group(2).strip()
+    start_index = int(start_index_str) - 1 if start_index_str else 0  # Convert to 0-based index
+
+    if not os.path.isfile(m3u_path):
+        print(f"M3U file not found at {m3u_path}")
+        return
+
+    with open(m3u_path, 'r') as f:
+        lines = f.readlines()
+
+    # Filter out comments (lines starting with "#") and empty lines
+    playlist_files = [line.strip() for line in lines if line.strip() and not line.strip().startswith('#')]
+    if start_index < 0 or start_index >= len(playlist_files):
+        print("Start index out of bounds in the M3U file.")
+        return
+
+    # Take up to 20 tracks from the playlist starting at start_index
+    selected_files = playlist_files[start_index: start_index + 20]
+    m3u_spawn_indices = []
+    m3u_dir = os.path.dirname(m3u_path)
+
+    for file_path in selected_files:
+        # If the path is relative, convert it to an absolute path based on the M3U file's directory.
+        if not os.path.isabs(file_path):
+            file_path = os.path.abspath(os.path.join(m3u_dir, file_path))
+        spawn_id = find_spawn_id_for_file(file_path, valid_tracks)
+        if spawn_id is None:
+            print(f"Could not match spawn_id for file: {file_path}")
+            continue
+        # Find the index of the track with the matching spawn_id in valid_tracks
+        idx = next((i for i, t in enumerate(valid_tracks) if t.get("spawn_id", "").lower() == spawn_id.lower()), None)
+        if idx is not None:
+            m3u_spawn_indices.append(idx)
+        else:
+            print(f"Spawn ID {spawn_id} not found in valid tracks for file: {file_path}")
+
+    if not m3u_spawn_indices:
+        print("No matching tracks found for the M3U playlist.")
+        return
+
+    global current_m3u_indices
+    current_m3u_indices = m3u_spawn_indices
+
+    # Update the scatter plot:
+    # Grey out all data points first.
+    new_colors = np.full((len(coords), 4), [0.9, 0.9, 0.9, 0.5])
+    new_sizes = np.full(len(coords), 8)
+    # Then, for the playlist points, restore their original colors and increase marker size.
+    for idx in m3u_spawn_indices:
+        new_colors[idx] = original_colors[idx]  # Retain the original color from @gen tag.
+        new_sizes[idx] = 30                     # Increase marker size.
+    scatter.set_facecolors(new_colors)
+    scatter.set_sizes(new_sizes)
+
+    # Remove any existing overlay scatter for M3U points (if any)
+    for child in list(ax.collections):
+        if hasattr(child, "m3u_overlay") and child.m3u_overlay:
+            child.remove()
+    
+    # Create an overlay scatter for the M3U-connected points to bring them to the front.
+    m3u_coords = coords[m3u_spawn_indices]
+    if coords.shape[1] == 2:
+        m3u_overlay = ax.scatter(m3u_coords[:, 0], m3u_coords[:, 1],
+                                 c=[original_colors[i] for i in m3u_spawn_indices],
+                                 s=20, zorder=3)
+    elif coords.shape[1] == 3:
+        m3u_overlay = ax.scatter(m3u_coords[:, 0], m3u_coords[:, 1], m3u_coords[:, 2],
+                                 c=[original_colors[i] for i in m3u_spawn_indices],
+                                 s=20, zorder=3)
+    # Tag this overlay for future removal
+    m3u_overlay.m3u_overlay = True
+
+    # Remove existing playlist lines (if any)
+    for line in list(ax.lines):
+        if hasattr(line, "get_color") and line.get_color() is not None:
+            line.remove()
+
+
+    # Draw gradient lines connecting the points in playlist order.
+    num_segments = len(m3u_coords) - 1
+    if num_segments > 0:
+        # Create a custom colormap transitioning through multiple colors.
+        cmap = mcolors.LinearSegmentedColormap.from_list(
+            "custom_gradient",
+            ["red", "orange", "yellow", "green", "blue", "indigo", "violet"]
+        )
+        for i in range(num_segments):
+            # Compute fraction so that the first segment is red and the last is violet.
+            frac = i / (num_segments - 1) if num_segments > 1 else 0.5
+            color = cmap(frac)
+            x_vals = [m3u_coords[i, 0], m3u_coords[i+1, 0]]
+            y_vals = [m3u_coords[i, 1], m3u_coords[i+1, 1]]
+            if coords.shape[1] == 2:
+                ax.plot(x_vals, y_vals, color=color, lw=2)
+            elif coords.shape[1] == 3:
+                z_vals = [m3u_coords[i, 2], m3u_coords[i+1, 2]]
+                ax.plot(x_vals, y_vals, z_vals, color=color, lw=2)
+
+    plt.draw()
+    plt.pause(0.001)
+
 def on_search_submit(text, coords, valid_tracks, scatter, fig, ax, original_colors):
     """
     Highlights points that match the entered search term using case-insensitive and fuzzy matching.
     Supports OR (",") and AND ("+") search logic.
     Allows filtering by specific metadata fields using "@gen" syntax.
+    Also supports an "@m3u" command to load a playlist and draw connecting lines.
     """
-    text = text.strip().lower()
-    if text.startswith("the "):
-        text = text[4:]  # Remove leading "The " if present
+    raw_text = text.strip()  # Preserve original case for file paths
+    text_lower = raw_text.lower()  # Use this for command detection and search matching
 
-    # Check if the search term is blank
-    if not text:
+    text = text.strip().lower()
+
+    # Check for the special "@m3u" command first.
+    if '@m3u' in text_lower:
+        process_m3u_command(raw_text, coords, valid_tracks, scatter, fig, ax, original_colors)
+        return
+
+    if text_lower.startswith("the "):
+        text_lower = text_lower[4:]  # Remove leading "the "
+
+    # If search is blank, reset colors and sizes
+    if not text_lower:
         scatter.set_facecolors(original_colors)  # Reset colors
         scatter.set_sizes([8] * len(coords))  # Reset point sizes
         scatter.set_zorder(1)  # Reset z-order to default
@@ -315,6 +487,8 @@ def main():
     parser.add_argument("--components",
                         help="Number of output dimensions (2 or 3).",
                         type=int, default=2)
+    parser.add_argument("-m3u", "--m3u", action="store_true",
+                        help="Prompt for M3U playlist input")
     args = parser.parse_args()
 
     # Setup logging
@@ -418,11 +592,7 @@ def main():
 
         # TextBox widget for search functionality
         text_box_ax = plt.axes([0.2, 0.01, 0.6, 0.05])
-        text_box = TextBox(
-            text_box_ax, 
-            'Search: ', 
-            initial=""
-        )
+        text_box = TextBox(text_box_ax, 'Search: ', initial="")
         text_box.on_submit(lambda text: on_search_submit(text, coords, valid_tracks, sc, fig, ax, original_colors))
 
         # Ensure the text box is focused when clicked, enabling keyboard shortcuts
@@ -436,14 +606,53 @@ def main():
         text_box_ax.set_navigate(False)  # Prevents the plot from interpreting keyboard events
         text_box_ax.figure.canvas.mpl_connect('button_press_event', lambda event: text_box.begin_typing())
 
+        # If the CLI flag is used, repeatedly prompt for M3U input
+        if args.m3u:
+            while True:
+                user_input = input("Please enter path to M3U playlist (and optionally also starting track location): ")
+                if user_input.strip() == "":
+                    # If input is empty, remove M3U overlays/lines and reset the plot.
+                    sc.set_facecolors(original_colors)
+                    sc.set_sizes([8] * len(coords))
+                    # Remove overlay scatter objects marked as m3u_overlay
+                    for child in list(ax.collections):
+                        if hasattr(child, "m3u_overlay") and child.m3u_overlay:
+                            child.remove()
+                    # Remove any lines (playlist connecting lines)
+                    for line in list(ax.lines):
+                        line.remove()
+                    plt.draw()
+                    plt.pause(0.001)
+                    print("M3U overlay removed.")
+                    break
+                else:
+                    # Parse the input using shlex to support paths with spaces.
+                    import shlex
+                    tokens = shlex.split(user_input)
+                    if not tokens:
+                        print("No input provided. Please try again.")
+                        continue
+                    playlist_path = tokens[0]
+                    start_track = tokens[1] if len(tokens) > 1 else "1"
+                    # Build command string expected by process_m3u_command:
+                    if start_track != "1":
+                        cmd_str = f"@m3u-{start_track} {playlist_path}"
+                    else:
+                        cmd_str = f"@m3u {playlist_path}"
+                    process_m3u_command(cmd_str, coords, valid_tracks, sc, fig, ax, original_colors)
+
         # Enable mplcursors for hover tooltips in 2D
         cursor2 = mplcursors.cursor(sc, hover=True)
         active_annotations = []
 
         @cursor2.connect("add")
         def on_add(sel):
-            idx = sel.index
-            track_info = valid_tracks[idx]
+            global current_m3u_indices
+            # If in M3U mode and the hovered index is not in the M3U indices, skip showing a tooltip
+            if current_m3u_indices is not None and sel.index not in current_m3u_indices:
+                sel.annotation.set_visible(False)
+                return
+            track_info = valid_tracks[sel.index]
             
             # Get artist name
             artist_data = track_info.get("©ART", ["Unknown"])
@@ -560,8 +769,12 @@ def main():
 
         @cursor3.connect("add")
         def on_add_3d(sel):
-            idx = sel.index
-            track_info = valid_tracks[idx]
+            global current_m3u_indices
+            # If in M3U mode and the hovered index is not in the M3U indices, skip showing a tooltip
+            if current_m3u_indices is not None and sel.index not in current_m3u_indices:
+                sel.annotation.set_visible(False)
+                return
+            track_info = valid_tracks[sel.index]
 
             # Get artist name
             artist_data = track_info.get("©ART", ["Unknown"])
