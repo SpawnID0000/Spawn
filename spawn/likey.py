@@ -147,7 +147,7 @@ def generate_recommended_playlist(spawn_root: str, embeddings: dict, threshold: 
         return
 
     # 2. Build explicit ratings from the favorites.
-    favorites = filter_tracks_by_favorites(full_tracks, spawn_root, "4")
+    favorites, _, _ = filter_tracks_by_favorites(full_tracks, spawn_root, "3")
     explicit_ratings = {}
     for track in favorites:
         sid = track.get("spawn_id")

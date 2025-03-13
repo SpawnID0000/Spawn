@@ -255,27 +255,16 @@ def main():
             update_favorites_menu(lib_path)
 
         elif choice == "3":
-            from .curator import (
-                run_curator_basic,
-                run_curator_feature,
-                run_curator_advanced
-            )
+            from .curator import run_curator
 
             if not lib_path or not os.path.isdir(lib_path):
                 lib_path = input("Enter the path to your Spawn project root: ").strip()
                 if not os.path.isdir(lib_path):
                     print("[ERROR] Invalid path. Cannot create curated playlist.")
-                    break
+                    continue
 
-            ans_advanced = input("\nWould you like to run advanced curation? ([y]/n): ").strip().lower()
-            if ans_advanced in ["", "y"]:
-                run_curator_advanced(lib_path, is_admin=env_is_admin)
-            else:
-                ans_feature = input("\nWould you like to use feature-based ordering? (y/[n]): ").strip().lower()
-                if ans_feature == "y":
-                    run_curator_feature(lib_path, is_admin=env_is_admin)
-                else:
-                    run_curator_basic(lib_path, is_admin=env_is_admin)
+            run_curator(lib_path, is_admin=env_is_admin)
+
 
         elif choice == "4":
             from .player import play_m3u_menu
