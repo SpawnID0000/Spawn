@@ -98,11 +98,13 @@ def play_m3u_menu(spawn_root: str, debug_to_console: bool = False):
         logger.error(msg)
         return
 
-    # Gather .m3u files recursively
+    # Gather .m3u files recursively, ignoring hidden files
     all_m3u_files = []
     for root, dirs, files in os.walk(playlists_dir):
+        # Exclude hidden directories
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
         for f in files:
-            if f.lower().endswith(".m3u"):
+            if f.lower().endswith(".m3u") and not f.startswith("."):
                 full_path = os.path.join(root, f)
                 all_m3u_files.append(full_path)
 
@@ -139,7 +141,7 @@ def play_m3u_menu(spawn_root: str, debug_to_console: bool = False):
     else:
         # user typed a path
         potential_path = os.path.expanduser(choice)
-        if os.path.isfile(potential_path):
+        if os.path.isfile(potential_path) and not os.path.basename(potential_path).startswith("."):
             selected_path = potential_path
         else:
             print(f"[WARN] The file '{potential_path}' does not exist. Aborting.")
