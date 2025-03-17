@@ -8,6 +8,7 @@ from .track_importer import run_import
 from .favs import update_favorites_menu
 from .curator import run_curator
 from .player import play_m3u_menu
+from .dumb import convert_m3u_to_file_sequence
 
 def store_key_in_env_file(env_path, key, value):
     """
@@ -136,7 +137,8 @@ def main():
         print("    2) Update favorites")
         print("    3) Create curated playlist")
         print("    4) Play M3U playlist")
-        print("    5) Playlist Import/Export, Plex")
+        print("    5) Convert M3U to file folder (for dumb players)")
+        print("    6) Playlist import/export (Plex)")
 
         while True:
             choice = input("\nEnter choice: ").strip()
@@ -276,22 +278,34 @@ def main():
                 if not os.path.isdir(lib_path):
                     print("[ERROR] Invalid path. Cannot play M3U.")
                     return
+            convert_m3u_to_file_sequence(lib_path)
+
+        elif choice == "6":
+            if not lib_path or not os.path.isdir(lib_path):
+                lib_path = input("Enter the path to your Spawn project root: ").strip()
+                if not os.path.isdir(lib_path):
+                    print("[ERROR] Invalid path. Cannot play M3U.")
+                    return
             # Ensure Plex API parameters are available
             plex_serv_url = os.environ.get("PLEX_SERV_URL", "").strip()
             plex_token = os.environ.get("PLEX_TOKEN", "").strip()
+            plex_user_uuid = os.environ.get("PLEX_USER_UUID", "").strip()
+
             if not plex_serv_url:
                 plex_serv_url = input("Enter Plex Server URL (e.g., http://192.168.86.67:32400): ").strip()
                 store_key_in_env_file(apid_env, "PLEX_SERV_URL", plex_serv_url)
             if not plex_token:
                 plex_token = input("Enter Plex Token: ").strip()
                 store_key_in_env_file(apid_env, "PLEX_TOKEN", plex_token)
+            if not plex_user_uuid:
+                plex_user_uuid = input("Enter your Plex User UUID (or accountID): ").strip()
+                store_key_in_env_file(apid_env, "PLEX_USER_UUID", plex_user_uuid)
 
             # Plex Playlist Operations sub-menu
             print("\nPlex Playlist Operations:")
             print("    1) Export playlist to Plex")
             print("    2) Import playlist from Plex")
-            print("    3) Top Rate all tracks on Plex playlist")
-            print("    4) Import Plex play log")
+            print("    3) Import Plex play log")
             while True:
                 plex_choice = input("\nEnter choice: ").strip()
                 if not plex_choice:
@@ -311,12 +325,8 @@ def main():
                     export_playlists(plex_serv_url, plex_token)
                     break
                 elif plex_choice == "3":
-                    from .plex.Plex_Playlist_Rater import rate_playlists
-                    rate_playlists(plex_serv_url, plex_token)
-                    break
-                elif plex_choice == "4":
-                    from .plex.Plex_Play_Log_Exporter import export_recently_played
-                    export_recently_played(plex_serv_url, plex_token)
+                    from .plex.Plex_Play_Log_Exporter import export_recent_plays_json
+                    export_recent_plays_json(plex_serv_url, plex_token, plex_user_uuid)
                     break
                 else:
                     print("Please enter a valid option.")

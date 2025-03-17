@@ -5,7 +5,10 @@ import json
 import difflib
 import shlex
 import sqlite3
-from mutagen import File as AudioFile  # For audio duration extraction
+import tempfile
+import unicodedata
+import re
+from mutagen import File as AudioFile
 
 FAVS_FOLDER = "Spawn/aux/user/favs"  # subfolder relative to LIB_PATH
 
@@ -13,7 +16,8 @@ def update_favorites_menu(spawn_root):
     """
     Main entry point for the 'Update favorites' feature.
     Asks which list of favorites we are updating (Artists, Albums, or Tracks),
-    or alternatively, exports favorite tracks as an M3U playlist.
+    or alternatively, exports favorite tracks as an M3U playlist,
+    imports favorite tracks from Plex, or rates Plex playlists.
     
     :param spawn_root: The root path to the Spawn project (where "aux/user/favs" resides).
     """
@@ -22,8 +26,10 @@ def update_favorites_menu(spawn_root):
     print("    2) Albums")
     print("    3) Tracks")
     print("\nOr, alternatively:")
-    print("    4) Export M3U of Favorite Tracks")
-    valid_choices = ["1", "2", "3", "4"]
+    print("    4) Export M3U of favorite tracks")
+    print("    5) Import favorite tracks from Plex")
+    print("    6) Mark all tracks in a Plex playlist as favorites")
+    valid_choices = ["1", "2", "3", "4", "5", "6"]
     choice = input("\nEnter choice: ").strip()
 
     if choice not in valid_choices:
@@ -32,6 +38,22 @@ def update_favorites_menu(spawn_root):
 
     if choice == "4":
         export_favorite_tracks_m3u(spawn_root)
+        return
+
+    elif choice == "5":
+        import_from_plex_favorites(spawn_root)
+        return
+
+    elif choice == "6":
+        # Ensure Plex API parameters are available
+        plex_serv_url = os.environ.get("PLEX_SERV_URL", "").strip()
+        plex_token = os.environ.get("PLEX_TOKEN", "").strip()
+        if not plex_serv_url:
+            plex_serv_url = input("Enter Plex Server URL (e.g., http://192.168.86.67:32400): ").strip()
+        if not plex_token:
+            plex_token = input("Enter Plex Token: ").strip()
+        from .plex.Plex_Playlist_Rater import rate_playlists
+        rate_playlists(plex_serv_url, plex_token)
         return
 
     # --- Original logic for choices 1-3 ---
@@ -65,9 +87,13 @@ def update_favorites_menu(spawn_root):
     fav_type_map = {"1": "artists", "2": "albums", "3": "tracks"}
     fav_type = fav_type_map[choice]
 
+    # Prepare path for fav_tracks.json
     favs_folder = os.path.join(spawn_root, FAVS_FOLDER)
     os.makedirs(favs_folder, exist_ok=True)
     fav_file = os.path.join(favs_folder, f"fav_{fav_type}.json")
+    existing_tracks = load_favorites_file(fav_file)
+    if not isinstance(existing_tracks, list):
+        existing_tracks = []
 
     existing_favs = load_favorites_file(fav_file)
     db_path = os.path.join(spawn_root, "Spawn", "aux", "glob", "spawn_catalog.db")
@@ -306,6 +332,217 @@ def export_favorite_tracks_m3u(spawn_root):
     print(f"\n[INFO] Exported favorite tracks to M3U: {export_file}")
 
 
+def normalize_text(s):
+    """
+    Normalizes text for matching by:
+      1. Converting to Unicode NFKD form and encoding to ASCII (dropping non-ASCII characters)
+      2. Converting to lowercase.
+      3. Removing all whitespace and non-alphanumeric characters.
+    """
+    if not s:
+        return ""
+    # Normalize and drop non-ASCII characters
+    normalized = unicodedata.normalize('NFKD', s).encode('ASCII', 'ignore').decode('utf-8')
+    normalized = normalized.lower().strip()
+    # Remove all whitespace and punctuation to get a compact key for matching
+    normalized = re.sub(r'\s+', '', normalized)      # remove whitespace
+    normalized = re.sub(r'[^\w]', '', normalized)      # remove non-alphanumeric characters
+    return normalized
+
+
+def get_embedded_spawn_id(file_path):
+    """
+    Attempts to read the embedded spawn_ID tag from the given file.
+    The tag key is "----:com.apple.iTunes:spawn_ID". Returns the value as a string if found;
+    otherwise returns None.
+    """
+    try:
+        audio = AudioFile(file_path)
+        if audio and audio.tags:
+            tag_val = audio.tags.get("----:com.apple.iTunes:spawn_ID")
+            if tag_val:
+                if isinstance(tag_val, list):
+                    tag_val = tag_val[0]
+                # If the tag is in bytes, decode it.
+                if isinstance(tag_val, bytes):
+                    tag_val = tag_val.decode('utf-8', errors='ignore')
+                return tag_val.strip()
+    except Exception as e:
+        print(f"[WARN] Could not read embedded spawn_ID from file {file_path}: {e}")
+    return None
+
+
+def import_from_plex_favorites(spawn_root):
+    """
+    Imports favorite tracks from the Plex playlist titled '❤️ Tracks'
+    by exporting the playlist to a temporary M3U file and then parsing it.
+    For each parsed entry, it first attempts to read an embedded spawn_ID from the file.
+    That value is used as the primary search term for the database lookup.
+    If not found, it falls back to matching on artist/album/track.
+    """
+    # Load Plex credentials from environment variables
+    plex_serv_url = os.environ.get("PLEX_SERV_URL", "").strip()
+    plex_token = os.environ.get("PLEX_TOKEN", "").strip()
+
+    if not plex_serv_url:
+        plex_serv_url = input("Enter Plex Server URL (e.g., http://192.168.86.67:32400): ").strip()
+    if not plex_token:
+        plex_token = input("Enter Plex Token: ").strip()
+
+    # Import Plex exporter functions
+    from .plex import Plex_Playlist_Exporter as plex_exporter
+
+    playlists = plex_exporter.get_playlists(plex_serv_url, plex_token)
+    if not playlists:
+        print("[ERROR] Could not fetch playlists from Plex.")
+        return
+
+    # Find the playlist titled '❤️ Tracks'
+    target_playlist = None
+    for pl in playlists:
+        if pl['title'] == "❤️ Tracks":
+            target_playlist = pl
+            break
+
+    if not target_playlist:
+        print("[ERROR] Playlist '❤️ Tracks' not found in Plex playlists.")
+        return
+
+    print(f"[INFO] Found Plex playlist: {target_playlist['title']}. Fetching tracks...")
+    tracks = plex_exporter.get_playlist_tracks(plex_serv_url, plex_token, target_playlist['key'])
+    if not tracks:
+        print("[ERROR] No tracks found in '❤️ Tracks'.")
+        return
+
+    # Export tracks to a temporary M3U file
+    temp_dir = os.path.join(spawn_root, "Spawn", "aux", "temp")
+    os.makedirs(temp_dir, exist_ok=True)
+    temp_m3u_path = os.path.join(temp_dir, f"plex_favs_import_log.m3u")
+    #import uuid
+    #temp_m3u_path = os.path.join(temp_dir, f"temp_plex_export_{uuid.uuid4().hex}.m3u")
+
+    with open(temp_m3u_path, "w", encoding="utf-8") as temp_m3u:
+        temp_m3u.write("#EXTM3U\n")
+        for track in tracks:
+            duration = track.get('duration', -1)
+            artist = track.get('artist', '').strip()
+            title = track.get('title', '').strip()
+            # Write EXTINF line and then the file path (assuming Plex provides an absolute path)
+            temp_m3u.write(f"#EXTINF:{duration},{artist} - {title}\n")
+            file_path = track.get('file', '').strip()
+            temp_m3u.write(f"{file_path}\n")
+        temp_m3u_path = temp_m3u.name
+
+    print(f"[INFO] Exported temporary M3U file at: {temp_m3u_path}")
+
+    # Parse the temporary M3U file
+    m3u_entries = parse_m3u_custom(temp_m3u_path)
+
+    # Deduplicate m3u_entries by normalized (artist, album, track)
+    unique_entries = {}
+    for entry in m3u_entries:
+        key = (normalize_text(entry.get("artist") or ""),
+               normalize_text(entry.get("album") or ""),
+               normalize_text(entry.get("track") or ""))
+        if key not in unique_entries:
+            unique_entries[key] = entry
+    m3u_entries = list(unique_entries.values())
+
+    # Remove the temp M3U file
+    try:
+        os.remove(temp_m3u_path)
+    except Exception as e:
+        print(f"[WARN] Could not remove temporary M3U file: {e}")
+
+    # Prepare path for fav_tracks.json
+    favs_folder = os.path.join(spawn_root, FAVS_FOLDER)
+    os.makedirs(favs_folder, exist_ok=True)
+    fav_tracks_file = os.path.join(favs_folder, "fav_tracks.json")
+    existing_tracks = load_favorites_file(fav_tracks_file)
+    if not isinstance(existing_tracks, list):
+        existing_tracks = []
+
+    # Build a set of normalized keys from existing tracks (artist, album, track)
+    existing_keys = set()
+    # Also build a set of existing Spawn IDs
+    existing_spawn_ids = set()
+    for item in existing_tracks:
+        if isinstance(item, dict):
+            key = (normalize_text(item.get("artist")),
+                   normalize_text(item.get("album")),
+                   normalize_text(item.get("track")))
+            existing_keys.add(key)
+            sid = item.get("spawn_id")
+            if sid:
+                existing_spawn_ids.add(sid.strip())
+
+    new_tracks = []
+    # Get the path to the spawn_catalog.db for database lookups.
+    db_path = os.path.join(spawn_root, "Spawn", "aux", "glob", "spawn_catalog.db")
+
+    for entry in m3u_entries:
+        artist = (entry.get("artist") or "").strip()
+        album = (entry.get("album") or "").strip()
+        title = (entry.get("track") or "").strip()
+        filepath = (entry.get("filepath") or "").strip()
+        # Compute the normalized key from text (for fallback)
+        norm_key = (normalize_text(artist), normalize_text(album), normalize_text(title))
+        # If this normalized key is already in existing favorites, skip
+        if norm_key in existing_keys:
+            continue
+
+        # Try to read the embedded spawn_ID from the file.
+        embedded_spawn_id = get_embedded_spawn_id(filepath)
+
+        # Now determine spawn_id:
+        if embedded_spawn_id:
+            spawn_ids = [embedded_spawn_id]
+        else:
+            spawn_ids = lookup_in_spawn_catalog(db_path, artist=artist, track=title, album=album)
+
+        if spawn_ids:
+            spawn_id = spawn_ids[0]
+            # Check if this spawn_id is already in the JSON file.
+            if spawn_id and spawn_id.strip() in existing_spawn_ids:
+                continue
+            track_data = get_track_data(db_path, spawn_id)
+            if track_data:
+                new_track = track_data
+            else:
+                new_track = {
+                    "artist": artist,
+                    "album": album,
+                    "track": title,
+                    "track_mbid": None,
+                    "spawn_id": spawn_id
+                }
+        else:
+            new_track = {
+                "artist": artist,
+                "album": album,
+                "track": title,
+                "track_mbid": None,
+                "spawn_id": None
+            }
+        new_tracks.append(new_track)
+        existing_keys.add(norm_key)
+        if new_track.get("spawn_id"):
+            existing_spawn_ids.add(new_track.get("spawn_id").strip())
+
+    if new_tracks:
+        merged_tracks = existing_tracks + new_tracks
+        merged_tracks.sort(key=lambda x: (normalize_text(x.get("artist")),
+                                          normalize_text(x.get("album")),
+                                          normalize_text(x.get("track"))))
+        save_favorites_file(fav_tracks_file, merged_tracks)
+        print(f"[INFO] Imported {len(new_tracks)} new favorite tracks from Plex playlist '❤️ Tracks'.")
+        print("\n[INFO] New tracks added:")
+        for track in new_tracks:
+            print(f"  - {track.get('artist', 'Unknown Artist')} - {track.get('track', 'Unknown Title')} (Album: {track.get('album', 'Unknown Album')})")
+    else:
+        print("[INFO] No new favorite tracks found in Plex playlist '❤️ Tracks'.")
+
+
 def get_symlink_target(spawn_root, spawn_id):
     """
     Given the spawn_root and a Spawn ID, returns a tuple:
@@ -366,7 +603,7 @@ def parse_m3u_custom(m3u_path):
     Parses an M3U file specifically for lines of the form:
         #EXTINF:xxx,Artist - Track
         ../Music/Artist/Album/track.m4a
-    Returns a list of dicts with keys "artist", "track", and "album".
+    Returns a list of dicts with keys "artist", "track", "album", and "filepath".
     """
     result = []
     with open(m3u_path, "r", encoding="utf-8") as f:
@@ -382,7 +619,12 @@ def parse_m3u_custom(m3u_path):
 
     for extinf_line, file_path in entries:
         maybe_artist, maybe_track, album = parse_extinf_and_filepath(extinf_line, file_path)
-        result.append({"artist": maybe_artist, "track": maybe_track, "album": album})
+        result.append({
+            "artist": maybe_artist,
+            "track": maybe_track,
+            "album": album,
+            "filepath": file_path
+        })
     return result
 
 
