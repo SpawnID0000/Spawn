@@ -78,7 +78,7 @@ import builtins
 import unicodedata
 
 from mutagen import File as MutagenFile
-from mutagen.mp4 import MP4FreeForm, MP4Cover, MP4Tags
+from mutagen.mp4 import MP4, MP4FreeForm, MP4Cover, MP4Tags
 from acoustid import WebServiceError, NoBackendError
 from logging.handlers import TimedRotatingFileHandler
 from collections import defaultdict, Counter
@@ -348,7 +348,7 @@ def fetch_with_retry(url, max_retries=3):
     attempt = 1
     while attempt <= max_retries:
         try:
-            print(f"Attempt {attempt} of {max_retries} for URL: {url}")
+            print(f"\nAttempt {attempt} of {max_retries} for URL: {url}")
             response = requests.get(url)
             return response
 
@@ -414,11 +414,17 @@ def store_db_revision(db_path, db_rev_val):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
+    # Find the current highest remaining revision_id
+    cursor.execute("SELECT MAX(revision_id) FROM db_revisions;")
+    max_rev = cursor.fetchone()[0] or 0  # Default to 0 if table is empty
+
+    next_rev = max_rev + 1
+
     sql = """
-        INSERT INTO db_revisions (db_rev)
-        VALUES (?)
+        INSERT INTO db_revisions (revision_id, db_rev)
+        VALUES (?, ?)
     """
-    cursor.execute(sql, (db_rev_val,))
+    cursor.execute(sql, (next_rev, db_rev_val))
     conn.commit()
     conn.close()
 
@@ -625,7 +631,7 @@ def fetch_tags_from_user_db(spawn_id_val, table="lib_tracks", lib_db_path=None):
     except json.JSONDecodeError:
         return None
 
-def store_tags_in_db(spawn_id, tag_dict, metadata_rev=None):
+def store_tags_in_db(DB_PATH, spawn_id, tag_dict, metadata_rev=None):
     """
     Insert or replace a row in the 'tracks' table in the main spawn_catalog.db,
     storing the final DESIRED_TAGS as JSON form. Skips 'covr' or other
@@ -979,7 +985,7 @@ def handle_existing_spawn_id(
             logger.warning(f"Error bumping metadata_rev: {e}")
 
         incoming_tags["----:com.apple.iTunes:metadata_rev"] = new_rev
-        store_tags_in_db(spawn_id_str, incoming_tags, metadata_rev=new_rev)
+        store_tags_in_db(DB_PATH, spawn_id_str, incoming_tags, metadata_rev=new_rev)
 
         # Also rewrite tags so disk matches updated DB
         rewrite_tags(new_file_path, incoming_tags)
@@ -1008,7 +1014,6 @@ def handle_existing_spawn_id(
 def bump_metadata_rev(old_val: str) -> str:
     """
     Example: "AAA" -> "AAB", "AAB" -> "AAC". If it's not in that style, fallback.
-    You can expand this logic as desired.
     """
     if not old_val or len(old_val) < 3:
         return "AAA"
@@ -1016,6 +1021,47 @@ def bump_metadata_rev(old_val: str) -> str:
     last_char = old_val[-1]  # e.g. "A"
     next_char = chr(ord(last_char) + 1)  # "B"
     return prefix + next_char
+
+
+def update_embedded_metadata_rev(file_path, new_rev):
+    """
+    Opens the MP4 file at file_path, updates its embedded metadata_rev tag
+    (under "----:com.apple.iTunes:metadata_rev") with new_rev (stored as bytes via MP4FreeForm),
+    saves the file, then re-reads the file to verify the update.
+    """
+    try:
+        audio = MP4(file_path)
+
+        # Get the current metadata_rev; default to bytes for consistency.
+        current_rev = audio.tags.get("----:com.apple.iTunes:metadata_rev", [b"AAA"])
+        if isinstance(current_rev, list) and len(current_rev) > 0:
+            # Convert current_rev to a string for logging, if it's bytes.
+            if isinstance(current_rev[0], bytes):
+                current_rev_str = current_rev[0].decode("utf-8", errors="replace")
+            else:
+                current_rev_str = str(current_rev[0])
+        else:
+            current_rev_str = "AAA"
+        logger.debug(f"Current embedded metadata_rev for {file_path}: {current_rev_str}")
+
+        # Update the tag: encode the new_rev as UTF-8 bytes and wrap it in MP4FreeForm.
+        new_rev_bytes = new_rev.encode("utf-8")
+        audio.tags["----:com.apple.iTunes:metadata_rev"] = [MP4FreeForm(new_rev_bytes)]
+        audio.save()
+
+        # Re-read the file to verify the update.
+        updated_audio = MP4(file_path)
+        updated_rev = updated_audio.tags.get("----:com.apple.iTunes:metadata_rev", [b"UNKNOWN"])
+        # Convert updated_rev for logging.
+        if isinstance(updated_rev, list) and len(updated_rev) > 0 and isinstance(updated_rev[0], bytes):
+            updated_rev_str = updated_rev[0].decode("utf-8", errors="replace")
+        else:
+            updated_rev_str = str(updated_rev[0]) if updated_rev else "UNKNOWN"
+        logger.info(f"Updated embedded metadata_rev to {updated_rev_str} for file {file_path}\n")
+
+    except Exception as e:
+        logger.error(f"Error updating embedded metadata_rev for file {file_path}: {e}")
+
 
 def bump_db_alpha_part(alpha: str) -> str:
     """
@@ -2110,7 +2156,7 @@ def rewrite_tags(file_path, tags):
             audio.tags[tag] = value
 
     audio.save()
-    logger.info(f"Updated tags successfully written to: {file_path}\n")
+    logger.info(f"Updated tags successfully written to: {file_path}")
 
 
 ###############################################################################
@@ -2723,11 +2769,89 @@ def validate_spotify_artist_id(artist_name, artist_id, token):
 # ReplayGain Calculation (Album-Based)
 ###############################################################################
 
-def run_replaygain_on_folder(cleaned_files_map):
+def get_embedded_tags(file_path):
+    """
+    Reads the embedded tags from the given MP4 file using mutagen.
+    Returns a dictionary of tags.
+    """
+    try:
+        audio = MP4(file_path)
+        tags = {}
+        if audio.tags:
+            for key, value in audio.tags.items():
+                # Normalize list values to a single value if appropriate
+                if isinstance(value, list) and len(value) == 1:
+                    tags[key] = value[0]
+                else:
+                    tags[key] = value
+        # Ensure we store the file path in the tags (normalized)
+        tags["file_path"] = os.path.normpath(file_path)
+        logger.debug(f"Embedded tags for {file_path}: {tags}")
+        return tags
+    except Exception as e:
+        logger.info(f"Error reading embedded tags from {file_path}: {e}")
+        return {}
+
+
+def update_album_rg_for_spawn_id(DB_PATH, spawn_id, album_gain, album_peak):
+    """
+    Searches for a record in the tracks table where the spawn_id column matches the given spawn_id.
+    If found, it updates the JSON stored in tag_data by replacing the keys
+      "----:com.apple.iTunes:replaygain_album_gain" and "----:com.apple.iTunes:replaygain_album_peak"
+    with the new values, and bumps the metadata revision.
+    """
+    # Convert bytes to string if necessary.
+    if isinstance(spawn_id, bytes):
+        spawn_id = spawn_id.decode('utf-8')
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        # Look up the record by spawn_id (the database column).
+        cursor.execute("SELECT tag_data FROM tracks WHERE spawn_id = ?", (spawn_id,))
+        row = cursor.fetchone()
+        if row:
+            tag_data_json = row[0]
+            try:
+                tags = json.loads(tag_data_json)
+            except Exception as e:
+                logger.info(f"Error parsing JSON for spawn_id {spawn_id}: {e}")
+                conn.close()
+                return
+            # Update only the album ReplayGain values (stored as lists)
+            tags["----:com.apple.iTunes:replaygain_album_gain"] = [album_gain]
+            tags["----:com.apple.iTunes:replaygain_album_peak"] = [album_peak]
+
+            # Retrieve the current metadata_rev.
+            old_rev = tags.get("----:com.apple.iTunes:metadata_rev", "AAA")
+            if isinstance(old_rev, list):
+                old_rev = old_rev[0]
+            try:
+                new_rev = bump_metadata_rev(old_rev)
+            except Exception as e:
+                logger.warning(f"Error bumping metadata_rev: {e}")
+                new_rev = old_rev
+            tags["----:com.apple.iTunes:metadata_rev"] = [new_rev]
+
+            new_json = json.dumps(tags, ensure_ascii=False, sort_keys=True)
+            cursor.execute("UPDATE tracks SET tag_data = ? WHERE spawn_id = ?", (new_json, spawn_id))
+            conn.commit()
+            logger.info(f"Updated album ReplayGain and bumped metadata_rev for spawn_id {spawn_id} in DB.")
+            conn.close()
+            return new_rev
+        else:
+            logger.info(f"No record found in DB for spawn_id {spawn_id}.")
+        conn.close()
+    except Exception as e:
+        logger.info(f"Error updating DB for spawn_id {spawn_id}: {e}")
+
+
+def run_replaygain_on_folder(cleaned_files_map, DB_PATH):
     """
     Uses `rsgain easy <folder>` to do a multi-track album scan on all cleaned files
-    in that folder.  Parse the output lines to extract track-level
-    and album-level gain/peak, then update each file's temp_tags.
+    in that folder, ensuring previously existing tracks are also included.
+    Parses the output lines to extract track-level and album-level gain/peak values,
+    then updates each file's temp_tags. After updating, it calls store_tags_in_db
+    for each track to update the spawn_catalog.db with the new album ReplayGain values.
 
     'cleaned_files_map' is:
         {
@@ -2749,7 +2873,42 @@ def run_replaygain_on_folder(cleaned_files_map):
     file_list = list(cleaned_files_map.keys())
     any_file_path = file_list[0]
     folder_path = os.path.dirname(any_file_path)
-    logger.info(f"Calculating album ReplayGain via 'rsgain easy \"{folder_path}\"' for folder with {len(file_list)} tracks...\n")
+
+    # Gather all .m4a files in the folder, ignoring hidden files.
+    existing_tracks = [
+        os.path.join(folder_path, f)
+        for f in os.listdir(folder_path)
+        if f.lower().endswith(".m4a") and not f.startswith('.') and not f.startswith("._")
+    ]
+    file_count = len(existing_tracks)
+
+    # If cover art exists, embed it into any new track that doesn't already have cover art.
+    cover_art_path = os.path.join(folder_path, "cover.jpg")
+    if os.path.exists(cover_art_path):
+        logger.info(f"Found existing album art at {cover_art_path}")
+        for file_path in existing_tracks:
+            norm_path = os.path.normpath(file_path)
+            base_name = os.path.basename(norm_path)
+            # Skip temporary files.
+            if base_name.startswith("temp_"):
+                continue
+            # Get embedded tags.
+            tags = get_embedded_tags(norm_path)
+            if "covr" not in tags:
+                logger.info(f"No cover art found in {norm_path}. Embedding existing album art.")
+                # Pass the tags dictionary to the helper.
+                embed_cover_art_into_file(norm_path, cover_art_path, tags)
+            else:
+                logger.info(f"Cover art already present in {norm_path}\n")
+    else:
+        logger.info("No existing cover.jpg found in the album folder; proceeding with external lookups.")
+
+
+    # Run ReplayGain on the folder
+    # logger.info(f"[DEBUG] All detected tracks in folder before ReplayGain calculation:")
+    # for track in existing_tracks:
+    #     logger.info(f"   {track}")
+    logger.info(f"Calculating album ReplayGain via 'rsgain easy \"{folder_path}\"' for folder with {file_count} tracks...\n")
 
     cmd = ["rsgain", "easy", folder_path]
     try:
@@ -2761,6 +2920,7 @@ def run_replaygain_on_folder(cleaned_files_map):
             text=True
         )
         output = proc.stdout
+        logger.debug("rsgain output:\n" + output)
 
         album_gain = None
         album_peak = None
@@ -2770,17 +2930,6 @@ def run_replaygain_on_folder(cleaned_files_map):
         track_rg_map = {}
         current_file = None
 
-        # Expect lines like:
-        # Track: /Users/.../cleaned_1-06 Toxic.m4a
-        #   Loudness: ...
-        #   Peak:     1.000000 (0.00 dB)
-        #   Gain:     -9.28 dB
-        #
-        # Album:
-        #   Loudness: ...
-        #   Peak:     ...
-        #   Gain:     ...
-        #
         # Parse them with simple state-based logic or regex:
         for line in output.splitlines():
             line_str = line.strip()
@@ -2793,11 +2942,13 @@ def run_replaygain_on_folder(cleaned_files_map):
                 track_path_norm = os.path.normpath(track_path)
                 track_rg_map[track_path_norm] = [None, None]  # placeholders
                 current_file = track_path_norm
+                logger.debug(f"Found track: {track_path_norm}")
                 continue
 
             # Detect "Album:" line
             if line_lower.startswith("album:"):
                 current_file = "ALBUM"
+                logger.debug("Entering album section")
                 continue
 
             # If in a track section
@@ -2808,11 +2959,13 @@ def run_replaygain_on_folder(cleaned_files_map):
                     if mg:
                         track_peak = mg.group(1)
                         track_rg_map[current_file][1] = track_peak
+                        logger.debug(f"Track {current_file} peak: {track_peak}")
                 elif line_lower.startswith("gain:"):
                     mg = re.search(r"gain:\s*([-+]?\d+(?:\.\d+)?)\s*dB", line_str, re.IGNORECASE)
                     if mg:
                         track_gain = mg.group(1) + " dB"
                         track_rg_map[current_file][0] = track_gain
+                        logger.debug(f"Track {current_file} gain: {track_gain}")
 
             # If in the album section
             elif current_file == "ALBUM":
@@ -2821,12 +2974,14 @@ def run_replaygain_on_folder(cleaned_files_map):
                     mg = re.search(r"peak:\s*([\d.]+)", line_str, re.IGNORECASE)
                     if mg:
                         album_peak = mg.group(1)
+                        logger.debug(f"Album peak: {album_peak}")
                 elif line_lower.startswith("gain:"):
                     mg = re.search(r"gain:\s*([-+]?\d+(?:\.\d+)?)\s*dB", line_str, re.IGNORECASE)
                     if mg:
                         album_gain = mg.group(1) + " dB"
+                        logger.debug(f"Album gain: {album_gain}")
 
-        # Now apply these RG values to the tags
+        # Now apply these ReplayGain values to the in-memory tags
         for path_key, tags in cleaned_files_map.items():
             norm_path = os.path.normpath(path_key)
             # track-level
@@ -2841,6 +2996,48 @@ def run_replaygain_on_folder(cleaned_files_map):
                 tags["----:com.apple.iTunes:replaygain_album_gain"] = album_gain
             if album_peak:
                 tags["----:com.apple.iTunes:replaygain_album_peak"] = album_peak
+            logger.debug(f"Updated cleaned_files_map for {norm_path}: {tags}")
+
+        # Now update the database for every track in the folder.
+        # For each file, read the updated embedded tags (if not already in cleaned_files_map)
+        # to obtain the spawn_id, then update the corresponding DB entry.
+        for file_path in existing_tracks:
+            norm_path = os.path.normpath(file_path)
+            base_name = os.path.basename(norm_path)
+            if base_name.startswith("temp_"):
+                #logger.info(f"Skipping database update for temporary file {norm_path}.")
+                continue
+
+            logger.info(f"Processing file for database update: {norm_path}")
+
+            # Use tags from cleaned_files_map if available; otherwise, read from the file
+            if norm_path in cleaned_files_map:
+                tags = cleaned_files_map[norm_path]
+                logger.debug(f"Using tags from cleaned_files_map for {norm_path}: {tags}")
+            else:
+                tags = get_embedded_tags(norm_path)
+                logger.debug(f"Read tags from file for {norm_path}: {tags}")
+            # Ensure the album ReplayGain values are set in tags.
+            if album_gain:
+                tags["----:com.apple.iTunes:replaygain_album_gain"] = album_gain
+            if album_peak:
+                tags["----:com.apple.iTunes:replaygain_album_peak"] = album_peak
+
+            # Extract the spawn ID from the embedded tags.
+            spawn_id = tags.get("----:com.apple.iTunes:spawn_ID")
+            if spawn_id and isinstance(spawn_id, bytes):
+                spawn_id = spawn_id.decode('utf-8')
+            logger.info(f"For file {norm_path}, found spawn_ID: {spawn_id}")
+
+            if spawn_id:
+                # Update only the album ReplayGain keys for the matching DB record.
+                new_rev = update_album_rg_for_spawn_id(DB_PATH, spawn_id, album_gain, album_peak)
+
+                # If the DB update bumped metadata_rev, update the embedded tag as well.
+                if new_rev:
+                    update_embedded_metadata_rev(norm_path, new_rev)
+            else:
+                logger.info(f"Skipping DB update for {norm_path} as no spawn_ID found in embedded tags.")
 
     except FileNotFoundError:
         logger.info("ERROR: rsgain not found in PATH. Please install or adapt to another tool.")
@@ -3201,7 +3398,7 @@ def update_disc_and_track_numbers_from_mbz(temp_tags, any_db_changes_ref, file_p
                     temp_tags["----:com.apple.iTunes:metadata_rev"] = new_rev
                     any_db_changes_ref[0] = True
                     rewrite_tags(file_path, temp_tags)
-                    store_tags_in_db(spawn_id_str, temp_tags, metadata_rev=new_rev)
+                    store_tags_in_db(DB_PATH, spawn_id_str, temp_tags, metadata_rev=new_rev)
                     logger.info(f"  => Overwriting partial => trkn={new_trkn}, disk={new_disk}\n")
                     logger.info(f"  => Also incrementing track's metadata_rev to {new_rev}")
 
@@ -3231,7 +3428,7 @@ def update_disc_and_track_numbers_from_mbz(temp_tags, any_db_changes_ref, file_p
                             old_rev = temp_tags.get("----:com.apple.iTunes:metadata_rev", "AAA")
                             any_db_changes_ref[0] = True
                             rewrite_tags(file_path, temp_tags)
-                            store_tags_in_db(spawn_id_str, temp_tags, metadata_rev=old_rev)
+                            store_tags_in_db(DB_PATH, spawn_id_str, temp_tags, metadata_rev=old_rev)
                             
                         except Exception as e:
                             logger.warning(f"Could not parse => {e}, keeping existing.")
@@ -3246,8 +3443,8 @@ def update_disc_and_track_numbers_from_mbz(temp_tags, any_db_changes_ref, file_p
                 #temp_tags["----:com.apple.iTunes:metadata_rev"] = new_rev
                 any_db_changes_ref[0] = True
                 rewrite_tags(file_path, temp_tags)
-                #store_tags_in_db(spawn_id_str, temp_tags, metadata_rev=new_rev)
-                store_tags_in_db(spawn_id_str, temp_tags)
+                #store_tags_in_db(DB_PATH, spawn_id_str, temp_tags, metadata_rev=new_rev)
+                store_tags_in_db(DB_PATH, spawn_id_str, temp_tags)
                 #logger.info(f"  => Incrementing track's metadata_rev to {new_rev}")
             return
 
@@ -3276,7 +3473,7 @@ def update_disc_and_track_numbers_from_mbz(temp_tags, any_db_changes_ref, file_p
                 temp_tags["----:com.apple.iTunes:metadata_rev"] = new_rev
                 any_db_changes_ref[0] = True
                 rewrite_tags(file_path, temp_tags)
-                store_tags_in_db(spawn_id_str, temp_tags, metadata_rev=new_rev)
+                store_tags_in_db(DB_PATH, spawn_id_str, temp_tags, metadata_rev=new_rev)
                 #logger.info(f"  => Incrementing track's metadata_rev to {new_rev}")
             else:
                 logger.debug("User chose not to overwrite => ask if they want new custom values?")
@@ -3305,7 +3502,7 @@ def update_disc_and_track_numbers_from_mbz(temp_tags, any_db_changes_ref, file_p
                         old_rev = temp_tags.get("----:com.apple.iTunes:metadata_rev", "AAA")
                         any_db_changes_ref[0] = True
                         rewrite_tags(file_path, temp_tags)
-                        store_tags_in_db(spawn_id_str, temp_tags, metadata_rev=old_rev)
+                        store_tags_in_db(DB_PATH, spawn_id_str, temp_tags, metadata_rev=old_rev)
 
                     except Exception as e:
                         logger.warning(f"Could not parse user input => {e}, keeping existing track/disc.")
@@ -3541,17 +3738,21 @@ def get_image_dimensions(image_url):
         return None
 
 
-def get_album_art(track_id, mbid, client_id, client_secret, min_dimension=640):
+def get_album_art(track_id, mbid, client_id, client_secret, album_folder, min_dimension=640):
     """
-    1) Attempt to fetch from CAA
-       - if it's found and at least min_dimension in width & height, return it
-       - otherwise, we still might fallback to Spotify
-    2) Then fetch from Spotify
-       - check its dimensions
-       - pick whichever is bigger
+    1) If album_folder contains a cover.jpg file, return its path immediately.
+    2) Otherwise, attempt to fetch album art from Cover Art Archive (CAA) and Spotify.
+    
+    - For CAA: if found and at least min_dimension in width & height, return its URL.
+    - Otherwise, fall back to Spotify and pick whichever image is larger.
     """
+    # 0) Check for local album art first.
+    local_cover = os.path.join(album_folder, "cover.jpg")
+    if os.path.exists(local_cover):
+        logger.info(f"Using existing album art from {local_cover}.")
+        return local_cover
 
-    # 1) Try Cover Art Archive
+    # 1) Try Cover Art Archive (CAA)
     logger.debug(f"Fetching CAA album art for MBID: {mbid}")
     caa_art_url = fetch_caa_art(mbid)   # e.g. "https://coverartarchive.org/release-group/..."
     caa_dims = None
@@ -3765,7 +3966,8 @@ def embed_cover_art_into_file(audio_path, cover_jpeg_path, tags_dict):
     """
     Embeds the cover art, and also puts 'covr' into tags_dict so rewrite_tags() won't remove it.
     """
-    audio = MutagenFile(audio_path)
+    audio = MP4(audio_path)
+    #audio = MutagenFile(audio_path)
     if not audio:
         logger.info(f"Unable to load file for embedding: {audio_path}")
         return
@@ -3944,6 +4146,11 @@ def process_audio_files(
     7. Create symlinks for each imported track.
     8. Generate embeddings and M3U playlist.
     """
+
+    # Ensure USER_DB_PATH is not None
+    if USER_DB_PATH is None:
+        raise ValueError("USER_DB_PATH (database path) must be provided.")
+
     global PLAYLISTS_DIR, spawn_id_to_embeds
 
     any_db_changes_ref = [False]  # store as list-of-bool so sub-functions can set it
@@ -4289,7 +4496,7 @@ def process_audio_files(
                     # spawn_id_val exists but is not found in main DB => brand new track ID for admin or user
                     temp_tags["----:com.apple.iTunes:metadata_rev"] = "AAA"
                     if is_admin:
-                        store_tags_in_db(spawn_id_val, temp_tags, metadata_rev="AAA")
+                        store_tags_in_db(DB_PATH, spawn_id_val, temp_tags, metadata_rev="AAA")
                         any_db_changes_ref[0] = True
                     else:
                         # user mode => store in lib_tracks
@@ -4313,7 +4520,7 @@ def process_audio_files(
                     temp_tags[spawn_id_tag] = new_id
                     temp_tags["----:com.apple.iTunes:metadata_rev"] = "AAA"
 
-                    store_tags_in_db(new_id, temp_tags, metadata_rev="AAA")
+                    store_tags_in_db(DB_PATH, new_id, temp_tags, metadata_rev="AAA")
                     any_db_changes_ref[0] = True
 
                 else:
@@ -4483,9 +4690,9 @@ def process_audio_files(
 
         # After processing all tracks in this folder, handle album-level ReplayGain and album art
         if cleaned_files_map:
-            run_replaygain_on_folder(cleaned_files_map)
+            run_replaygain_on_folder(cleaned_files_map, DB_PATH)
 
-            # Fetch album art
+            # Fetch album art parameters from tags
             artist_name = temp_tags.get("©ART", ["Unknown"])[0] if isinstance(temp_tags.get("©ART"), list) else "Unknown"
             album_title = temp_tags.get("©alb", ["Unknown"])[0] if isinstance(temp_tags.get("©alb"), list) else "Unknown"
             def _tag_to_str(val):
@@ -4510,29 +4717,38 @@ def process_audio_files(
             artist_dir = sanitize_for_directory(artist_name)
             album_dir  = sanitize_for_directory(album_name)
 
-            # 2) Construct the exact final output folder
+            # 2) Construct the exact final output folder (this is the destination for imported tracks)
             final_album_dir = os.path.join(OUTPUT_PARENT_DIR, artist_dir, album_dir)
             os.makedirs(final_album_dir, exist_ok=True)
 
-            # 3) Put cover.jpg in that final album directory
+            # 3) Define the path for cover art in the final album folder
             album_art_path = os.path.join(final_album_dir, "cover.jpg")
 
-            logger.debug(f"Calling get_album_art with Spotify Track ID: {spotify_track_id}, MBID: {musicbrainz_mbid}")
-            album_art_url = get_album_art(
-                track_id=spotify_track_id,
-                mbid=musicbrainz_mbid,
-                client_id=SPOTIFY_CLIENT_ID,
-                client_secret=SPOTIFY_CLIENT_SECRET
-            )
-
-            if album_art_url:
-                save_album_art(album_art_url, album_art_path)
+            # 4) Check for existing album art in the final album folder.
+            if os.path.exists(album_art_path):
+                logger.info(f"Found existing album art at {album_art_path}. Using it for new tracks.")
+                # Embed this cover art into all tracks (if not already present)
                 for final_path, final_tags in cleaned_files_map.items():
                     embed_cover_art_into_file(final_path, album_art_path, final_tags)
             else:
-                logger.info(f"No album art found for '{artist_name} - {album_name}'.")
+                logger.info(f"No cover.jpg found in {final_album_dir}; performing external album art lookup.")
+                # Here we pass final_album_dir as the album_folder to get_album_art.
+                album_art_url = get_album_art(
+                    track_id=spotify_track_id,
+                    mbid=musicbrainz_mbid,
+                    client_id=SPOTIFY_CLIENT_ID,
+                    client_secret=SPOTIFY_CLIENT_SECRET,
+                    album_folder=final_album_dir
+                )
 
-            # Rewrite tags one last time with final RG data and album art
+                if album_art_url:
+                    save_album_art(album_art_url, album_art_path)
+                    for final_path, final_tags in cleaned_files_map.items():
+                        embed_cover_art_into_file(final_path, album_art_path, final_tags)
+                else:
+                    logger.info(f"No album art found for '{artist_name} - {album_name}'.")
+
+            # Rewrite tags one last time with final ReplayGain data and album art
             for final_path, final_tags in cleaned_files_map.items():
                 rewrite_tags(final_path, final_tags)
 
@@ -4639,7 +4855,7 @@ def process_audio_files(
     #     but store final data in spawn_library.db.
     if is_admin:
         latest_rev = get_latest_db_rev(DB_PATH)
-        logger.info(f"Current DB revision is {latest_rev}")
+        logger.info(f"Current database revision is {latest_rev}\n")
         conn = sqlite3.connect(DB_PATH)
         old_count = get_total_track_count(DB_PATH)
     else:
@@ -4662,7 +4878,7 @@ def process_audio_files(
     logger.info("Done final pass. All tags are now forced through rewrite_tags logic.")
 
     # 2) Now store final tags in the database (excluding self, checking duplicates)
-    logger.info("Saving final track tags to database.")
+    logger.info("Saving final track tags to database.\n")
     for idx, (track_path, _) in enumerate(all_tracks):
         # re-extract truly final tags
         final_temp_tags = extract_desired_tags(track_path)
@@ -4758,7 +4974,7 @@ def process_audio_files(
                 # brand new spawn_id
                 if "----:com.apple.iTunes:metadata_rev" not in final_temp_tags:
                     final_temp_tags["----:com.apple.iTunes:metadata_rev"] = "AAA"
-                store_tags_in_db(spawn_id_str, final_temp_tags,
+                store_tags_in_db(DB_PATH, spawn_id_str, final_temp_tags,
                                  metadata_rev=final_temp_tags["----:com.apple.iTunes:metadata_rev"])
                 rewrite_tags(track_path, final_temp_tags)
             else:
@@ -4766,7 +4982,7 @@ def process_audio_files(
                 old_rev = db_tags.get("----:com.apple.iTunes:metadata_rev", "AAA")
                 new_rev = final_temp_tags.get("----:com.apple.iTunes:metadata_rev", old_rev)
                 final_temp_tags["----:com.apple.iTunes:metadata_rev"] = new_rev
-                store_tags_in_db(spawn_id_str, final_temp_tags, metadata_rev=new_rev)
+                store_tags_in_db(DB_PATH, spawn_id_str, final_temp_tags, metadata_rev=new_rev)
                 rewrite_tags(track_path, final_temp_tags)
         conn.close()
 
@@ -4861,17 +5077,35 @@ def process_audio_files(
             logger.warning(f"No spawn_id found for track {track_path}; skipping symlink creation.")
 
     # Generate album M3U playlists for newly imported album folders
-    logger.info("\nGenerating album M3U playlists for newly imported albums...")
-    new_album_folders = set()
+    logger.info("\n")
+    logger.info("Generating album M3U playlists for newly imported albums...")
+    album_folders = set()
     for (track_path, track_tags) in all_tracks:
         if track_tags is None:
             continue
         # Determine the album folder from the track_path.
         album_folder = os.path.dirname(track_path)
-        new_album_folders.add(album_folder)
-    
-    for album_folder in new_album_folders:
-        logger.info(f"Generating playlist for album folder: {album_folder}")
+        album_folders.add(album_folder)
+
+    for album_folder in album_folders:
+        logger.info(f"Ensuring album M3U includes all tracks for: {album_folder}")
+
+        # Scan for all existing symlinks in linx_dir that belong to this album
+        existing_symlinks = set()
+        if os.path.exists(linx_dir):
+            for symlink in os.listdir(linx_dir):
+                symlink_path = os.path.join(linx_dir, symlink)
+                if os.path.islink(symlink_path):
+                    target_path = os.path.realpath(symlink_path)
+                    # Ensure it belongs to the current album folder
+                    if os.path.dirname(target_path) == album_folder:
+                        existing_symlinks.add(symlink_path)
+
+        # Generate the playlist with both new and existing tracks
+        logger.info(f"Checking symlinks in {linx_dir} for album '{album_folder}'")
+        symlink_files = [f for f in os.listdir(linx_dir) if f.endswith('.m4a')]
+        #logger.info(f"Found {len(symlink_files)} symlinked tracks: {symlink_files}")
+        #logger.info(f"Found {len(symlink_files)} symlinked tracks.")
         generate_playlist_for_album(album_folder, linx_dir, alb_dir, use_absolute_paths=False)
 
     # M3U generation

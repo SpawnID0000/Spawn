@@ -26,6 +26,7 @@ import sys
 import argparse
 import logging
 import sqlite3
+from mutagen import File as MutagenFile
 
 # Setup basic logging:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -38,7 +39,6 @@ def extract_spawn_id(file_path: str) -> str:
     (or an empty string if not found).
     """
     try:
-        from mutagen import File as MutagenFile
         audio = MutagenFile(file_path)
         if audio is None or not audio.tags:
             return ""
@@ -187,12 +187,33 @@ def main():
                 print("\nSpawn IDs found in the symlink folder but not in the DB:")
                 for sid in sorted(extra_ids):
                     print(f"  {sid}")
+                # Prompt user for removal of extra symlinks
+                if input("\nWould you like to remove these symlink files? ([y]/n): ").strip().lower() != "n":
+                    for sid in sorted(extra_ids):
+                        symlink_path = os.path.join(linx_dir, f"{sid}.m4a")
+                        try:
+                            os.remove(symlink_path)
+                            print(f"Removed symlink: {symlink_path}")
+                            # Remove from broken_links if it was deleted
+                            if sid in broken_links:
+                                broken_links.remove(sid)
+                        except Exception as e:
+                            logger.error(f"Error removing symlink {symlink_path}: {e}")
             else:
                 print("\nNo extra Spawn IDs found in the symlink folder.")
             if broken_links:
                 print("\nSymlinks with broken targets (missing actual file):")
                 for sid in sorted(broken_links):
                     print(f"  {sid}")
+                # Prompt user for removal of broken symlinks
+                if input("\nWould you like to remove these broken symlink files? ([y]/n): ").strip().lower() != "n":
+                    for sid in sorted(broken_links):
+                        symlink_path = os.path.join(linx_dir, f"{sid}.m4a")
+                        try:
+                            os.remove(symlink_path)
+                            print(f"Removed broken symlink: {symlink_path}")
+                        except Exception as e:
+                            logger.error(f"Error removing broken symlink {symlink_path}: {e}")
             else:
                 print("\nAll symlinks point to existing files.")
         else:
@@ -204,6 +225,8 @@ def main():
             print("\n=== Spawn ID Comparison Report ===")
             print(f"Total spawn IDs in database ({table_name}): {len(db_spawn_ids)}")
             print(f"Total spawn IDs found in Music folder: {len(file_spawn_ids)}")
+
+
             if missing_ids:
                 print("\nSpawn IDs present in DB but not found in files:")
                 for sid in sorted(missing_ids):
@@ -214,6 +237,8 @@ def main():
                 print("\nSpawn IDs found in files but not present in DB:")
                 for sid in sorted(extra_ids):
                     print(f"  {sid}")
+
+
             else:
                 print("\nAll Spawn IDs from files were found in the database.\n")
         sys.exit(0)

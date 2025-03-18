@@ -340,7 +340,12 @@ def generate_playlist_for_album(album_dir: str, linx_dir: str, alb_dir: str, use
     for disc in sorted(expected_total.keys()):
         for t in range(1, expected_total[disc] + 1):
             filtered_files.append(mapping[disc][t])
-    
+
+    # If no tracks were found via track number extraction, fallback to sorted track_files
+    if not filtered_files:
+        logger.info("No standard tracks found via track number extraction; falling back to raw file order.")
+        filtered_files = [os.path.join(album_dir, f) for f in track_files]
+
     # Determine status: if file count exactly matches expected, status is "complete";
     # if there are extra files, status is "extra".
     status = "complete" if len(track_files) == expected_sum else "extra"

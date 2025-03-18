@@ -306,6 +306,7 @@ def main():
             print("    1) Export playlist to Plex")
             print("    2) Import playlist from Plex")
             print("    3) Import Plex play log")
+            print("    4) Find Plex GUIDs for all tracks")
             while True:
                 plex_choice = input("\nEnter choice: ").strip()
                 if not plex_choice:
@@ -327,6 +328,10 @@ def main():
                 elif plex_choice == "3":
                     from .plex.Plex_Play_Log_Exporter import export_recent_plays_json
                     export_recent_plays_json(plex_serv_url, plex_token, plex_user_uuid)
+                    break
+                elif plex_choice == "4":
+                    from .plex.Plex_track_finder import export_all_music
+                    export_all_music(plex_serv_url, plex_token, lib_path)
                     break
                 else:
                     print("Please enter a valid option.")
