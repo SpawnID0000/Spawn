@@ -13,7 +13,7 @@ PLEX_PLAYLIST_NAME = "All Music"
 def get_track_metadata(item):
     """
     Extract metadata from a Plex music track item.
-    Returns a dictionary with artist, album, track, plex_guid, spawn_id, and media type.
+    Returns a dictionary with artist, album, track, plex_guid, ratingKey, spawn_id, and media type.
     """
     try:
         artist = getattr(item, "grandparentTitle", "Unknown Artist")
@@ -23,6 +23,7 @@ def get_track_metadata(item):
         # Remove "plex://track/" prefix if present
         if plex_guid.startswith("plex://track/"):
             plex_guid = plex_guid.replace("plex://track/", "")
+        rating_key = getattr(item, "ratingKey", "")
         media_type = "track"
         spawn_id = ""
         
@@ -48,6 +49,7 @@ def get_track_metadata(item):
             "album": album,
             "track": track,
             "plex_guid": plex_guid,
+            "ratingKey": str(rating_key),
             "spawn_id": spawn_id,
             "media type": media_type,
         }, None
@@ -89,7 +91,7 @@ def export_all_music(plex_serv_url, plex_token, lib_path):
                 error_list.append(error)
         
         # Create output directories if they don't exist
-        output_dir = os.path.join(lib_path, "Spawn", "aux", "glob")
+        output_dir = os.path.join(lib_path, "Spawn", "aux", "user")
         log_dir = os.path.join(lib_path, "Spawn", "aux", "temp")
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(log_dir, exist_ok=True)
