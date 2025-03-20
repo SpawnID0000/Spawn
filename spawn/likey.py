@@ -128,8 +128,8 @@ def generate_recommended_playlist(spawn_root: str, embeddings: dict, threshold: 
     based on their like_likelihood scores. Tracks with a like_likelihood less than 1 (i.e. not favorites)
     but greater than or equal to 'threshold' (e.g., 0.85) are selected.
     
-    The selected tracks are grouped by genre and passed to the curator's function to write a curated M3U 
-    file. By providing a suffix, the resulting file gets a unique name (e.g. with '_recs' appended).
+    The selected tracks are grouped by genre and then ordered within each genre cluster using
+    chain-based curation. The final output is written as a curated M3U file with '_recs' appended.
     
     Parameters:
       spawn_root: Root path to the Spawn project.
@@ -137,9 +137,9 @@ def generate_recommended_playlist(spawn_root: str, embeddings: dict, threshold: 
       threshold: Float threshold for like_likelihood to include a track (default 0.85).
     """
     # Import required functions using relative imports.
-    from .curator import load_tracks_from_db, group_tracks_by_genre, write_curated_m3u, filter_tracks_by_favorites, safe_extract_first
+    from .curator import load_tracks_from_db, group_tracks_by_genre, write_curated_m3u, filter_tracks_by_favorites, safe_extract_first, chain_based_curation
 
-    # 1. Load the full library of tracks from the catalog database.
+    # 1. Load all tracks from the catalog database.
     db_path = os.path.join(spawn_root, "Spawn", "aux", "glob", "spawn_catalog.db")
     full_tracks = load_tracks_from_db(db_path)
     if not full_tracks:
@@ -185,10 +185,14 @@ def generate_recommended_playlist(spawn_root: str, embeddings: dict, threshold: 
 
     # 5. Group recommended tracks by genre.
     clusters = group_tracks_by_genre(recommended_tracks)
-    cluster_list = [(genre, tracks) for genre, tracks in clusters.items()]
 
-    # 6. Write the recommended curated M3U file with a '_recs' suffix.
-    m3u_path = write_curated_m3u(spawn_root, cluster_list, favorites_filter_desc="recommended", suffix="_recs")
+    # 6. Apply chain-based ordering within each genre cluster.
+    for genre, tracks in clusters.items():
+        clusters[genre] = chain_based_curation(tracks, embeddings)
+
+    # 7. Write the recommended curated M3U file with a '_recs' suffix.
+    m3u_path = write_curated_m3u(spawn_root, list(clusters.items()), favorites_filter_desc="recommended", suffix="_recs")
+
     if m3u_path:
         print(f"[INFO] Recommended curated playlist created at: {m3u_path}")
     else:
