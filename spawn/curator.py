@@ -29,6 +29,7 @@ from .audiodiffusion.audio_encoder import AudioEncoder
 #from .MP4ToVec import load_mp4tovec_model_torch
 from .MP4ToVec import load_mp4tovec_model_diffusion, generate_embedding
 from sklearn.metrics.pairwise import cosine_similarity
+from .likey import compute_like_likelihoods
 
 from .dic_spawnre import genre_mapping, subgenre_to_parent, genre_synonyms
 
@@ -410,22 +411,43 @@ def run_curator(spawn_root: str, is_admin: bool = True):
             print(f"[INFO] Retained {len(all_tracks)} user tracks that have a Spawn ID.")
 
     # ------------------------------------------------------------------------
-    # 3) Optionally filter by favorites
+    # Optionally filter by favorites, recommendations, or none
     # ------------------------------------------------------------------------
     favorites_filter_desc = None
     suffix = ""
     excluded_album_m3us = []
     excluded_albums = set()
 
-    ans_favs = input("\nWould you like to filter by favorites? (y/[n]): ").strip().lower()
-    if ans_favs == "y":
-        print("\nWhich would you like to include in the curated playlist?")
+    # Save a copy of the full track set (after file and Spawn ID filtering)
+    all_tracks_for_recs = list(all_tracks)
+
+    # Determine if any favorites JSON files exist
+    favs_folder = os.path.join(spawn_root, "Spawn", "aux", "user", "favs")
+    has_favs = (
+        os.path.isfile(os.path.join(favs_folder, "fav_artists.json")) or
+        os.path.isfile(os.path.join(favs_folder, "fav_albums.json")) or
+        os.path.isfile(os.path.join(favs_folder, "fav_tracks.json"))
+    )
+
+    print("\nFiltering options:")
+    if has_favs:
+        print("  1. Filter by favorites")
+        print("  2. Filter by recommendations")
+        print("  3. No filtering (use full catalog)")
+        filter_choice = input("\nEnter selection (1, 2, and/or [3]): ").strip()
+    else:
+        print("[INFO] No favorites metadata found; using full catalog (no filtering).")
+        filter_choice = "3"
+
+    if filter_choice == "1" and has_favs:
+        # --- Favorites filtering branch ---
+        print("\nWhich favorites would you like to include?")
         print("    1. favorite artists")
         print("    2. favorite albums")
         print("    3. favorite tracks")
 
         # Prompt user for input, ignoring commas/spaces/other text
-        fav_input = input("Enter your selection; any combination of 1, 2 , and/or [3]: ").strip()
+        fav_input = input("Enter your selection; any combination of 1, 2, and/or [3]: ").strip()
         if not fav_input:
             # Default to "3" (favorite tracks only) if user just hits Enter
             fav_options = {"3"}
@@ -434,13 +456,13 @@ def run_curator(spawn_root: str, is_admin: bool = True):
             # so "2,3", "2 3", "23", or "2 blah 3" all become {"2", "3"}
             matches = re.findall(r'[1-3]', fav_input)
             fav_options = set(matches)
-
             if not fav_options:
                 # If user typed something but no digits 1-3, skip filtering
                 print("[WARN] No valid favorites options recognized. Proceeding without favorites filtering.")
                 fav_options = set()  # empty => skip filtering logic
 
         if fav_options:
+            # This function updates the track set by removing tracks that match favorite albums (for example)
             all_tracks, excluded_albums, excluded_tracks = filter_tracks_by_favorites(all_tracks, spawn_root, fav_options)
 
             # Convert (artist_lower, album_lower) -> album_m3u_path
@@ -553,7 +575,103 @@ def run_curator(spawn_root: str, is_admin: bool = True):
             suffix = "_fav" + "".join(f"_{part}" for part in suffix_parts)
 
         else:
-            print("[WARN] Invalid selection. Proceeding without favorites filtering.")
+            favorites_filter_desc = None
+            suffix = ""
+
+    elif filter_choice == "2" and has_favs:
+        # --- Recommendation filtering branch (based on favorites ratings) ---
+        # Load favorites JSON to build explicit ratings.
+        fav_artists = load_favs_artists(os.path.join(favs_folder, "fav_artists.json"))
+        fav_albums  = load_favs_albums(os.path.join(favs_folder, "fav_albums.json"))
+        fav_tracks  = load_favs_tracks(os.path.join(favs_folder, "fav_tracks.json"))
+        explicit_ratings = {}
+        # Build explicit ratings from favorite tracks
+        for item in fav_tracks:
+            if isinstance(item, dict):
+                spid = item.get("spawn_id")
+            else:
+                spid = str(item)
+            if spid:
+                explicit_ratings[spid.strip()] = 1
+
+        # Attempt to load embeddings.
+        embeddings_path = os.path.join(spawn_root, "Spawn", "aux", "glob", "mp4tovec.p")
+        if not os.path.isfile(embeddings_path):
+            print(f"[ERROR] Embeddings file not found at: {embeddings_path}. Cannot apply recommendation filtering.")
+            favorites_filter_desc = None
+            suffix = ""
+        else:
+            try:
+                with open(embeddings_path, "rb") as f:
+                    embeddings = pickle.load(f)
+                if not isinstance(embeddings, dict):
+                    raise ValueError("Embeddings file does not contain a dictionary.")
+            except Exception as e:
+                print(f"[ERROR] Failed to load embeddings: {e}")
+                favorites_filter_desc = None
+                suffix = ""
+            else:
+                # Compute like-likelihood scores for all tracks using the full track set.
+                like_scores = compute_like_likelihoods(embeddings, explicit_ratings, sigma=0.15)
+                threshold = 0.98
+                recommended_tracks = []
+                for track in all_tracks_for_recs:
+                    # Use spawn_id as-is
+                    sid = track.get("spawn_id", "").strip()
+                    if sid in like_scores:
+                        score = like_scores[sid]
+                        # Exclude explicit favorites (score == 1) and select tracks above threshold.
+                        if score < 1.0 and score >= threshold:
+                            recommended_tracks.append(track)
+                all_tracks = recommended_tracks  # Replace the current set with recommended tracks.
+                favorites_filter_desc = f"recommended (like_likelihood >= {threshold:.2f})"
+                suffix = "_recs"
+
+                # Optional additional filtering by genre and/or artist
+                extra_filter = input(
+                    "\nIf you'd like to restrict recommendations to specific genres and/or artists,\n"
+                    "enter '@gen' or '@art' followed by a comma-separated list of values.\n"
+                    "Otherwise, just press Enter to continue: "
+                ).strip()
+                if extra_filter:
+                    extra_filter_str = extra_filter # Save the filter text for inclusion in the M3U comment
+                    extra_filter_lower = extra_filter.lower()
+                    filtered_tracks = []
+                    if extra_filter_lower.startswith("@gen"):
+                        # Extract genres (do not change case here, but we compare in lower-case)
+                        genres_str = extra_filter[4:].strip()
+                        genres_list = [g.strip().lower() for g in genres_str.split(",") if g.strip()]
+                        for track in all_tracks:
+                            # Check both the "©gen" tag and the "spawnre" tag.
+                            gen_tag = safe_extract_first(track, "©gen", normalize=True) or ""
+                            spawnre_tag = safe_extract_first(track, "----:com.apple.iTunes:spawnre", normalize=True) or ""
+                            combined_genres = (gen_tag + " " + spawnre_tag).lower()
+                            if combined_genres and any(g in combined_genres for g in genres_list):
+                                filtered_tracks.append(track)
+                        all_tracks = filtered_tracks
+                    elif extra_filter_lower.startswith("@art"):
+                        # Extract artist filter values.
+                        artists_str = extra_filter[4:].strip()
+                        artists_list = [a.strip().lower() for a in artists_str.split(",") if a.strip()]
+                        for track in all_tracks:
+                            artist = safe_extract_first(track, "©ART", normalize=True) or ""
+                            if artist.lower() and any(a in artist.lower() for a in artists_list):
+                                filtered_tracks.append(track)
+                        all_tracks = filtered_tracks
+                    else:
+                        print("[WARN] Unrecognized extra filter format; skipping extra filtering.")
+
+                    # Update the M3U filter description to include extra filter info.
+                    favorites_filter_desc += f" | Extra filter: {extra_filter_str}"
+
+    elif filter_choice == "3" or not filter_choice:
+        # --- No filtering branch ---
+        favorites_filter_desc = None
+        suffix = ""
+    else:
+        # Fallback if invalid selection or favorites metadata is missing.
+        favorites_filter_desc = None
+        suffix = ""
 
     # ------------------------------------------------------------------------
     # 4) Group into clusters by spawnre/©gen
@@ -819,16 +937,6 @@ def run_curator(spawn_root: str, is_admin: bool = True):
         if g.startswith("x"):
             decoded = decode_spawnre_hex(g)
             print(f"    {decoded}")
-
-    # ------------------------------------------------------------------------
-    # 9) (Advanced only) Recommendations
-    # ------------------------------------------------------------------------
-    if do_advanced:
-        recs_ans = input("\nWould you also like to generate a curated playlist of recommended tracks? (y/[n]): ").strip().lower()
-        if recs_ans == "y":    # Default "n"
-        #if recs_ans in ["", "y"]:    # Default "y"
-            from .likey import generate_recommended_playlist
-            generate_recommended_playlist(spawn_root, embeddings, threshold=0.98)
 
 
 ###############################################################################
