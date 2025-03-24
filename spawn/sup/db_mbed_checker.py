@@ -211,6 +211,10 @@ def check_spawn_ids(db_spawn_ids_set: set, emb_spawn_ids_set: set, emb_dict: dic
                 logger.info(f"New pickle saved at: {new_pickle_path}")
             except Exception as e:
                 logger.error(f"Failed to save new pickle: {e}")
+
+            # Update the embedding spawn IDs set after adding new embeddings
+            emb_spawn_ids_set = set(emb_dict.keys())
+
         else:
             logger.info("No changes made to the pickle file.")
 
@@ -383,17 +387,22 @@ def main() -> None:
                 if sid in spawnid_to_file:
                     file_path = spawnid_to_file[sid]
                     logger.info(f"Generating TF-IDF embedding for spawn_id {sid} from file {file_path}")
+
+                    # Generate raw snippet vectors for the track
                     try:
-                        embedding = calc_tfidf.generate_tfidf_embedding(file_path)
-                        if embedding is not None:
-                            emb_dict[sid] = embedding
-                            logger.info(f"Generated TF-IDF embedding for spawn_id {sid}")
+                        # Generate the TF-IDF embedding for this file.
+                        tfidf_embedding = calc_tfidf.generate_tfidf_embedding(file_path)
+                        if tfidf_embedding is not None:
+                            emb_dict[sid] = tfidf_embedding
+                            logger.info(f"Generated and added TF-IDF embedding for {sid}")
                         else:
-                            logger.error(f"Failed to generate TF-IDF embedding for spawn_id {sid}")
+                            logger.warning(f"No valid embedding found for {sid} from file {file_path}")
                     except Exception as e:
-                        logger.error(f"Error generating TF-IDF embedding for spawn_id {sid}: {e}")
+                        logger.error(f"Failed to process {sid} from file {file_path}: {e}")
+
                 else:
                     logger.warning(f"Could not find audio file for spawn_id {sid} in Music directory")
+
             # Save updated pickle.
             try:
                 with open(pickle_path, "wb") as f:
