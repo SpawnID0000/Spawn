@@ -1999,6 +1999,27 @@ def extract_year_from_tag_value(raw_value):
     return match.group(1) if match else None
 
 
+def fill_missing_basic_tags(mp4_file, file_path):
+    """Fill missing tags ©nam, ©alb, and ©ART/aART from file path context."""
+    tags = mp4_file.tags
+
+    # Get path components
+    filename = os.path.splitext(os.path.basename(file_path))[0]
+    album_folder = os.path.basename(os.path.dirname(file_path))
+    artist_folder = os.path.basename(os.path.dirname(os.path.dirname(file_path)))
+
+    if '©nam' not in tags:
+        tags['©nam'] = [filename]
+
+    if '©alb' not in tags:
+        tags['©alb'] = [album_folder]
+
+    if '©ART' not in tags:
+        tags['©ART'] = [artist_folder]
+    if 'aART' not in tags:
+        tags['aART'] = [artist_folder]
+
+
 def extract_desired_tags(file_path):
     """
     1. Read all tags from `file_path`.
@@ -2008,6 +2029,16 @@ def extract_desired_tags(file_path):
     4. After reading all tags, pick the oldest year from all matched date-like
        tags, set it in '©day', and remove other date-like tags from final output.
     """
+
+    # Update any missing basic tags using the MP4 object.
+    try:
+        mp4 = MP4(file_path)
+        fill_missing_basic_tags(mp4, file_path)
+        mp4.save()
+    except Exception as e:
+        logger.warning(f"  WARNING: Could not process MP4 tags for fallback in '{file_path}': {e}")
+
+    # Re-read the file so that the updated tags are loaded.
     audio = MutagenFile(file_path)
     if not audio or not audio.tags:
         logger.info(f"  WARNING: No tags found in '{file_path}'")
@@ -2060,12 +2091,12 @@ def extract_desired_tags(file_path):
             else:
                 temp_tags[mapped_tag] = raw_value
 
-        # 2) If it’s already an iTunes MP4 tag we care about
+        # 2) If it’s already an iTunes MP4 tag
         elif tag_lower in desired_tags_map:
             canonical = desired_tags_map[tag_lower]
             temp_tags[canonical] = raw_value
 
-        # 3) Collect possible date/year values so we can pick the oldest
+        # 3) Collect possible date/year values for picking the oldest
         if any(x in tag_lower for x in ["date", "year", "day"]):
             # parse out e.g. '1999'
             parsed_year = extract_year_from_tag_value(raw_value)
@@ -3672,10 +3703,15 @@ def generate_import_playlist(all_tracks, base_music_dir, playlists_dir):
 ###############################################################################
 
 def fetch_caa_art(mbid):
-    # Step 1: Construct the CAA URL
+    # Skip lookup if MBID is missing
+    if not mbid:
+        logger.info("Skipping Cover Art Archive lookup because MBID is missing.")
+        return None
+
+    # Construct the Cover Art Archive URL
     url = f"https://coverartarchive.org/release-group/{mbid}/front"
     
-    # Step 2: Query CAA (wrapped in retry logic)
+    # Query CAA with retry logic
     response = fetch_with_retry(url)
     if not response:
         logger.info(f"Aborted or failed to fetch album art for MBID: {mbid}")
@@ -3690,11 +3726,11 @@ def fetch_caa_art(mbid):
 
 
 def fetch_spotify_art(track_id, client_id, client_secret):
-    """
-    Fetches the album art URL for a given track_id.
-    First it obtains an access token (with retry logic) and then retrieves the track metadata.
-    If a request fails, it waits (1min, then 5min, then 15min, then 30min) and retries.
-    """
+    # Skip lookup if track_id is missing
+    if not track_id:
+        logger.info("Skipping Spotify album art lookup because track_id is missing.")
+        return None
+
     # Step 1: Get access token using the updated function (with retry)
     access_token = get_spotify_access_token()
     if not access_token:
@@ -4818,7 +4854,7 @@ def run_import(output_path, music_path, skip_prompts=False, keep_matched=False,
         caffeinate_process = None
 
     try:
-        global SKIP_PROMPTS, KEEP_MATCHED, OUTPUT_PARENT_DIR, LOG_DIR, LOG_FILE, DB_PATH, PLAYLISTS_DIR
+        global SKIP_PROMPTS, KEEP_MATCHED, OUTPUT_PARENT_DIR, LOG_DIR, LOG_FILE, DB_PATH, USER_DB_PATH, PLAYLISTS_DIR
         global ACOUSTID_API_KEY, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, DEFAULT_LASTFM_API_KEY
         global DEBUG_MODE, MP4TOVEC_MODEL, spawn_id_to_embeds, local_user_embeddings
 
