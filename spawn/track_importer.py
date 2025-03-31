@@ -4336,7 +4336,8 @@ def process_album_folder(folder, files_in_folder, keep_matched, lastfm_api_key, 
         artist_dir = sanitize_for_directory(artist_name)
         album_dir  = sanitize_for_directory(album_name)
         subpath    = os.path.join(artist_dir, album_dir)
-        temp_filename = f"temp_{i:02d}.m4a"
+        base = os.path.splitext(os.path.basename(file_path))[0]
+        temp_filename = f"temp_{base}.m4a"
         target_file   = os.path.join(OUTPUT_PARENT_DIR, subpath, temp_filename)
         os.makedirs(os.path.dirname(target_file), exist_ok=True)
 
