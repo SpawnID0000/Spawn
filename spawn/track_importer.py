@@ -1522,9 +1522,10 @@ def process_spawnre(
     temp_tags: dict
 ):
     """
-    1) Combine & refine => list of up to 5 final genres.
-    2) Build spawnre_hex => short hex code string.
-    3) Update temp_tags with new fields
+    1) Combine & refine genres from multiple sources.
+    2) Compute spawnre (multi-genre, up to 5), spawnre_hex (coded version),
+       and then determine the top genre.
+    3) Update temp_tags with these values.
     """
     combined = combine_and_prioritize_genres_refined(
         embedded_genre=embedded_genre,
@@ -1536,20 +1537,25 @@ def process_spawnre(
         genre_synonyms=genre_synonyms,
         artist_name=artist_name
     )
-
+    # combined is a list of up to 5 normalized genre strings.
     final_genres, spawnre_hex = find_closest_genre_matches(combined, genre_mapping)
+    
+    # Keep the multi-genre assignment as comma-separated values:
     spawnre = ", ".join(final_genres)
+    # And then choose a single top genre (for example, the first one)
+    top_genre = final_genres[0] if final_genres else ""
 
-    #logger.info(f"\n\n                           File: {file_path}")
     logger.info("")
     logger.info(f"  Artist: {artist_name}  |  Track: {track_title}")
     logger.info(f"  => Combined genres: {combined}")
-    logger.info(f"  => spawnre: '{spawnre}'")
-    logger.info(f"  => spawnre_hex: '{spawnre_hex}'\n")
+    logger.info(f"  => spawnre (multi): '{spawnre}'")
+    logger.info(f"  => spawnre_hex: '{spawnre_hex}'")
+    logger.info(f"  => Top genre (©gen): '{top_genre}'\n")
 
+    # Update custom tags with the multi-genre assignment:
     temp_tags["----:com.apple.iTunes:spawnre"] = spawnre.encode("utf-8")
     temp_tags["----:com.apple.iTunes:spawnre_hex"] = spawnre_hex.encode("utf-8")
-
+    temp_tags["©gen"] = top_genre
 
 # 4) Artist-level spawnre_tag
 #    Once all tracks have been processed, call this function to pick
@@ -4169,41 +4175,6 @@ def save_combined_embeddings(EMBED_PATH, spawn_id_to_embeds):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-import os
-import sys
-import subprocess
-import shlex
-import sqlite3
-import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials
-from collections import defaultdict, Counter
-from dotenv import load_dotenv
-import logging
-
-# Assumed external helper functions (define or import these):
-# extract_desired_tags, rewrite_tags, convert_flac_to_alac, repackage_alac_file, clean_or_repackage_aac,
-# detect_audio_format, sanitize_for_directory, get_album_art, save_album_art, embed_cover_art_into_file,
-# run_replaygain_on_folder, finalize_spawnre_tags, build_d_tt_title_filename, check_for_potential_match_in_db,
-# fetch_matching_spawn_id_from_db, generate_spawn_id, fetch_tags_from_db, handle_existing_spawn_id,
-# confirm_or_update_tags, update_disc_and_track_numbers_from_mbz, fetch_genre_lastfm, get_spotify_genres,
-# get_musicbrainz_genres, process_spawnre, store_tags_in_db, store_tags_in_user_db,
-# init_db, init_db_revisions, init_user_library_db, next_db_revision, store_db_revision,
-# generate_deejai_embedding_for_track, save_combined_embeddings, create_symlink_for_track,
-# generate_playlist_for_album, generate_import_playlist, remove_empty_music_dirs, load_mp4tovec_model_diffusion,
-# store_key_in_env_file, get_latest_db_rev, get_total_track_count, generate_local_id
-
 ###############################################################################
 # Helper: Process a Single Album Folder
 ###############################################################################
@@ -4347,6 +4318,7 @@ def process_album_folder(folder, files_in_folder, keep_matched, lastfm_api_key, 
                     spawn_id_val = generate_spawn_id()
                 temp_tags[spawn_id_tag] = spawn_id_val
             else:
+                # In user mode, do not generate a new spawn_id.
                 spawn_id_val = None
 
         # C. Detect audio format and build target filename
@@ -4386,6 +4358,7 @@ def process_album_folder(folder, files_in_folder, keep_matched, lastfm_api_key, 
 
         # E. Database updates (spawn_id assignment and duplicate-check logic)
         if spawn_id_val:
+            logger.info(f"[DB Update] spawn_id_val is: {spawn_id_val}")
             db_tags = fetch_tags_from_db(spawn_id_val)
             if db_tags is not None:
                 if is_admin:
@@ -4397,19 +4370,59 @@ def process_album_folder(folder, files_in_folder, keep_matched, lastfm_api_key, 
                         spawn_id_val = new_id
                         temp_tags[spawn_id_tag] = new_id
                 else:
-                    temp_tags["----:com.apple.iTunes:metadata_rev"] = db_tags.get("----:com.apple.iTunes:metadata_rev", "AAA")
+                    # For user mode: merge catalog metadata from spawn_catalog.db into temp_tags
+                    # Exclude only fields that are file-specific (e.g., Acoustid Fingerprint and ReplayGain fields)
+                    exclude_keys = {
+                        "----:com.apple.iTunes:Acoustid Fingerprint",
+                        "----:com.apple.iTunes:Acoustid Id",
+                        "----:com.apple.iTunes:replaygain_album_gain",
+                        "----:com.apple.iTunes:replaygain_album_peak",
+                        "----:com.apple.iTunes:replaygain_track_gain",
+                        "----:com.apple.iTunes:replaygain_track_peak",
+                    }
+                    for key, value in db_tags.items():
+                        if key not in exclude_keys:
+                            temp_tags[key] = value
+
+                    # Normalize catalog spawnre to derive the top genre
+                    spawnre_raw = db_tags.get("----:com.apple.iTunes:spawnre", [])
+                    if isinstance(spawnre_raw, list) and spawnre_raw:
+                        top_genre = spawnre_raw[0]
+                        temp_tags["©gen"] = [top_genre]
+                        logger.info(f"[User Mode] Set ©gen tag to top spawnre genre: {top_genre}")
+                    else:
+                        logger.warning(f"[User Mode] No spawnre genre list found in DB for spawn_id: {spawn_id_val}")
+
+                    # Also copy spawnre_hex if present
+                    if "----:com.apple.iTunes:spawnre_hex" in db_tags:
+                        temp_tags["----:com.apple.iTunes:spawnre_hex"] = db_tags["----:com.apple.iTunes:spawnre_hex"]
+
+                    # Remove unwanted extra keys, e.g. '©wrt'
+                    if "©wrt" in temp_tags:
+                        del temp_tags["©wrt"]
+
+                    # Ensure metadata_rev is set from catalog metadata
+                    metadata_rev_val = db_tags.get("----:com.apple.iTunes:metadata_rev", "AAA")
+                    temp_tags["----:com.apple.iTunes:metadata_rev"] = metadata_rev_val
+
+                    logger.info(f"[User Mode] Merged temp_tags before storing: {temp_tags}")
                     store_tags_in_user_db(
-                        spawn_id_val, temp_tags,
-                        metadata_rev=temp_tags["----:com.apple.iTunes:metadata_rev"],
-                        table="cat_tracks", lib_db_path=USER_DB_PATH
+                        spawn_id_val,
+                        temp_tags,
+                        metadata_rev=metadata_rev_val,
+                        table="cat_tracks",
+                        lib_db_path=USER_DB_PATH
                     )
+                    logger.info(f"[User Mode] Stored catalog metadata for spawn_id {spawn_id_val} with top genre '{top_genre}'")
             else:
+                logger.info("[DB Update] No catalog metadata found for spawn_id.")
                 temp_tags["----:com.apple.iTunes:metadata_rev"] = "AAA"
                 if is_admin:
                     store_tags_in_db(DB_PATH, spawn_id_val, temp_tags, metadata_rev="AAA")
                 else:
                     logger.info("[user] No match in catalog DB; deferring insertion.")
         else:
+            # For user mode, if no spawn_id is present, generate a local_ID.
             if is_admin:
                 new_id = generate_spawn_id()
                 logger.info(f"[admin] Assigning new spawn_id: {new_id}")
@@ -4454,6 +4467,7 @@ def process_album_folder(folder, files_in_folder, keep_matched, lastfm_api_key, 
             spotify_genres = get_spotify_genres(artist_name, sp)
             mb_genres = get_musicbrainz_genres(artist_name)
             if artist_name or track_title:
+                # In admin mode, compute spawnre if needed
                 process_spawnre(
                     file_path=target_file,
                     artist_name=artist_name,
@@ -4465,6 +4479,7 @@ def process_album_folder(folder, files_in_folder, keep_matched, lastfm_api_key, 
                     temp_tags=temp_tags
                 )
         else:
+            # User Mode: Retrieve spawn_id and local_id as usual
             spawn_id_val = temp_tags.get("----:com.apple.iTunes:spawn_ID")
             if isinstance(spawn_id_val, list) and spawn_id_val:
                 spawn_id_val = spawn_id_val[0]
@@ -4485,20 +4500,98 @@ def process_album_folder(folder, files_in_folder, keep_matched, lastfm_api_key, 
             if not id_str:
                 raise ValueError(f"No spawn_id or local_id available for file: {target_file}")
             logger.info(f"[User Mode] Retrieved spawnre info for spawn_id: {spawn_id_val}")
+            # Try fetching genre info from the catalog database:
             db_tags = fetch_tags_from_db(spawn_id_val) if spawn_id_val else {}
             if db_tags:
                 for key in ["----:com.apple.iTunes:spawnre", "----:com.apple.iTunes:spawnre_hex"]:
                     if key in db_tags:
                         temp_tags[key] = db_tags[key]
                         logger.info(f"[User Mode] Set {key} to: {db_tags[key]}")
-                spawnre_tag = db_tags.get("----:com.apple.iTunes:spawnre", "")
+                spawnre_tag = db_tags.get("----:com.apple.iTunes:spawnre", [])
+                if isinstance(spawnre_tag, bytes):
+                    spawnre_tag = spawnre_tag.decode("utf-8", errors="replace")
+                if isinstance(spawnre_tag, list) and spawnre_tag:
+                    top_genre = spawnre_tag[0]
+                    temp_tags["©gen"] = [top_genre]
+                    logger.info(f"[User Mode] Set ©gen tag to top spawnre genre: {top_genre}")
+                else:
+                    logger.info("[User Mode] DB entry exists but no spawnre tag found; computing spawnre.")
+                    # Fall back to computing spawnre for local tracks:
+                    def _tag_to_str(val):
+                        if isinstance(val, list) and val:
+                            val = val[0]
+                        if isinstance(val, bytes):
+                            val = val.decode("utf-8", errors="replace")
+                        return str(val).strip() if val else ""
+                    artist_name = _tag_to_str(temp_tags.get("©ART"))
+                    track_title = _tag_to_str(temp_tags.get("©nam"))
+                    embedded_gen = _tag_to_str(temp_tags.get("©gen"))
+                    last_fm_genres = fetch_genre_lastfm(artist_name, track_title, api_key=lastfm_api_key)
+                    spotify_genres = get_spotify_genres(artist_name, sp)
+                    mb_genres = get_musicbrainz_genres(artist_name)
+                    process_spawnre(
+                        file_path=target_file,
+                        artist_name=artist_name,
+                        track_title=track_title,
+                        embedded_genre=embedded_gen,
+                        last_fm_genres=last_fm_genres,
+                        spotify_genres=spotify_genres,
+                        musicbrainz_genres=mb_genres,
+                        temp_tags=temp_tags
+                    )
+                    # After computing, use the computed spawnre to update ©gen.
+                    spawnre_tag = temp_tags.get("----:com.apple.iTunes:spawnre", [])
+                    if isinstance(spawnre_tag, list) and spawnre_tag:
+                        top_genre = spawnre_tag[0]
+                    elif isinstance(spawnre_tag, bytes):
+                        top_genre = spawnre_tag.decode("utf-8", errors="replace").split(',')[0].strip()
+                    elif isinstance(spawnre_tag, str):
+                        top_genre = spawnre_tag.split(',')[0].strip()
+                    else:
+                        top_genre = ""
+
+                    if top_genre:
+                        temp_tags["©gen"] = [top_genre]
+                        logger.info(f"[User Mode] Computed and set ©gen tag to spawnre_tag: {top_genre}")
+                    else:
+                        logger.warning("[User Mode] Unable to compute spawnre tag for local track.")
+            else:
+                logger.info(f"[User Mode] No DB entry found for spawn_id: {spawn_id_val}; computing spawnre for local track.")
+                def _tag_to_str(val):
+                    if isinstance(val, list) and val:
+                        val = val[0]
+                    if isinstance(val, bytes):
+                        val = val.decode("utf-8", errors="replace")
+                    return str(val).strip() if val else ""
+                artist_name = _tag_to_str(temp_tags.get("©ART"))
+                track_title = _tag_to_str(temp_tags.get("©nam"))
+                embedded_gen = _tag_to_str(temp_tags.get("©gen"))
+                last_fm_genres = fetch_genre_lastfm(artist_name, track_title, api_key=lastfm_api_key)
+                spotify_genres = get_spotify_genres(artist_name, sp)
+                mb_genres = get_musicbrainz_genres(artist_name)
+                process_spawnre(
+                    file_path=target_file,
+                    artist_name=artist_name,
+                    track_title=track_title,
+                    embedded_genre=embedded_gen,
+                    last_fm_genres=last_fm_genres,
+                    spotify_genres=spotify_genres,
+                    musicbrainz_genres=mb_genres,
+                    temp_tags=temp_tags
+                )
+                # Ensure metadata_rev is preserved
+                metadata_rev_val = temp_tags.get("----:com.apple.iTunes:metadata_rev", "AAA")
+                temp_tags["----:com.apple.iTunes:metadata_rev"] = metadata_rev_val
+                # After computing, update ©gen to hold only the top genre:
+                spawnre_tag = temp_tags.get("----:com.apple.iTunes:spawnre", b"")
                 if isinstance(spawnre_tag, bytes):
                     spawnre_tag = spawnre_tag.decode("utf-8", errors="replace")
                 if spawnre_tag:
-                    temp_tags["©gen"] = spawnre_tag
-                    logger.info(f"[User Mode] Set ©gen tag to spawnre_tag: {spawnre_tag}")
-            else:
-                logger.error(f"[User Mode] No DB entry found for spawn_id: {spawn_id_val}")
+                    top_genre = spawnre_tag.split(',')[0].strip().lower()
+                    temp_tags["©gen"] = [top_genre]
+                    logger.info(f"[User Mode] Computed and set ©gen tag to top spawnre genre: {top_genre}")
+                else:
+                    logger.error(f"[User Mode] Unable to compute spawnre tag for track: {target_file}")
 
         # G. Save final state for this track
         def _decode_id_field(raw):
@@ -4506,7 +4599,7 @@ def process_album_folder(folder, files_in_folder, keep_matched, lastfm_api_key, 
                 raw = raw[0]
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8", errors="replace")
-            return str(raw).strip() if raw else None
+            return str(raw).strip() if raw else ""
         spawn_id_val = _decode_id_field(temp_tags.get("----:com.apple.iTunes:spawn_ID"))
         local_id = _decode_id_field(temp_tags.get("----:com.apple.iTunes:local_ID"))
         id_str = spawn_id_val or local_id
@@ -4615,6 +4708,8 @@ def process_audio_files_in_batches(input_dir, batch_threshold=10, keep_matched=F
                                               lastfm_api_key, sp, is_admin, USER_DB_PATH)
             if album_data:
                 mini_batch_album_data.append(album_data)
+        if is_admin:
+            finalize_spawnre_tags()
         # Finalize this mini-batch completely
         post_process_imported_tracks(mini_batch_album_data, is_admin, keep_matched, lastfm_api_key, sp)
         logger.info(f"Completed mini-batch of {len(mini_batch)} album folders.")
@@ -4631,6 +4726,7 @@ def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_
         logger.info("No tracks processed in this mini-batch for final post-processing.")
         return
 
+    logger.info("")
     logger.info("=== Final post-processing for current mini-batch: Rewriting tags ===")
     for (track_path, _, _) in all_tracks:
         final_tags = extract_desired_tags(track_path)
@@ -4640,6 +4736,7 @@ def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_
         rewrite_tags(track_path, final_tags)
         logger.debug(f"Final tags for {track_path}: {final_tags}")
 
+    logger.info("")
     logger.info("=== Renaming files to D-TT [spawn_id] - title.m4a ===")
     for idx, (old_path, track_tags, id_str) in enumerate(all_tracks):
         disc_tag = track_tags.get("disk")
@@ -4666,6 +4763,15 @@ def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_
                 logger.warning(f"Unable to rename file: {e}")
         else:
             logger.debug(f"File already named {new_path}, skipping rename.")
+        try:
+            audio = MP4(new_path)
+            audio["----:com.apple.iTunes:spawn_ID"] = [MP4FreeForm(spawn_id_str.encode("utf-8"))]
+            if spawn_id_str.startswith("xxx"):
+                audio["----:com.apple.iTunes:local_ID"] = [MP4FreeForm(spawn_id_str.encode("utf-8"))]
+            audio.save()
+            logger.info(f"Embedded spawn_ID ({spawn_id_str}) into tags for: {new_path}")
+        except Exception as e:
+            logger.warning(f"Failed to write spawn_ID to {new_path}: {e}")
 
     logger.info("All files renamed to D-TT [spawn_id] - title.m4a format.\n")
     logger.info("=== Duplicate-checking & Database Update for current mini-batch ===")
@@ -4685,6 +4791,7 @@ def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_
         if not final_temp_tags:
             logger.info(f"No tags found for DB insertion: {track_path}")
             continue
+        # Extract spawn_id from tags
         spawn_id_data = final_temp_tags.get("----:com.apple.iTunes:spawn_ID")
         if isinstance(spawn_id_data, list) and spawn_id_data:
             spawn_id_data = spawn_id_data[0]
@@ -4693,26 +4800,44 @@ def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_
         spawn_id_str = str(spawn_id_data).strip() if spawn_id_data else None
 
         if spawn_id_str:
-            if not keep_matched:
-                logger.info(f"Track {track_path} has spawn_id '{spawn_id_str}' but KEEP_MATCHED is False. Removing file.")
-                relative_path = os.path.relpath(track_path, start=OUTPUT_PARENT_DIR)
-                base_no_ext, _ = os.path.splitext(relative_path)
-                licn_root = os.path.join(os.path.dirname(OUTPUT_PARENT_DIR), "aux", "user", "licn")
-                new_txt_path = os.path.join(licn_root, base_no_ext + ".txt")
-                os.makedirs(os.path.dirname(new_txt_path), exist_ok=True)
-                try:
-                    with open(new_txt_path, "w", encoding="utf-8") as f:
-                        f.write("")
-                    logger.info(f"Blank txt file created => {new_txt_path}")
-                    os.remove(track_path)
-                    logger.info(f"Removed file: {track_path}")
-                except Exception as e:
-                    logger.warning(f"Error handling file {track_path}: {e}")
-                all_tracks[idx] = (new_txt_path, None, spawn_id_str)
-                continue
+            # Check if this spawn_id is already in the catalog DB.
+            db_tags = fetch_tags_from_db(spawn_id_str)
+            if db_tags is not None:
+                # It’s a duplicate from the catalog.
+                if not keep_matched:
+                    store_tags_in_user_db(
+                        spawn_id=spawn_id_str,
+                        #tag_dict=final_temp_tags,
+                        tag_dict=db_tags,   # Update cat_tracks in library database to exactly match the catalog database entry
+                        #metadata_rev=final_temp_tags.get("----:com.apple.iTunes:metadata_rev", "AAA"),
+                        metadata_rev=db_tags.get("----:com.apple.iTunes:metadata_rev", "AAA"),
+                        table="cat_tracks",
+                        lib_db_path=USER_DB_PATH
+                    )
+                    logger.info(f"Stored catalog metadata in cat_tracks for spawn_id: {spawn_id_str} before deletion.")
+                    logger.info(f"Track {track_path} has spawn_id '{spawn_id_str}' and a catalog match, but KEEP_MATCHED is False. Removing file.")
+                    relative_path = os.path.relpath(track_path, start=OUTPUT_PARENT_DIR)
+                    base_no_ext, _ = os.path.splitext(relative_path)
+                    licn_root = os.path.join(os.path.dirname(OUTPUT_PARENT_DIR), "aux", "user", "licn")
+                    new_txt_path = os.path.join(licn_root, base_no_ext + ".txt")
+                    os.makedirs(os.path.dirname(new_txt_path), exist_ok=True)
+                    try:
+                        with open(new_txt_path, "w", encoding="utf-8") as f:
+                            f.write("")
+                        logger.info(f"Blank txt file created => {new_txt_path}")
+                        os.remove(track_path)
+                        logger.info(f"Removed file: {track_path}")
+                    except Exception as e:
+                        logger.warning(f"Error handling file {track_path}: {e}")
+                    all_tracks[idx] = (new_txt_path, None, spawn_id_str)
+                    continue
+                else:
+                    newly_imported_tracks.append((spawn_id_str, final_temp_tags, track_path))
             else:
+                # No existing DB entry; treat as a new track.
                 newly_imported_tracks.append((spawn_id_str, final_temp_tags, track_path))
         else:
+            # No spawn_id found: fallback to local_id.
             local_id = final_temp_tags.get("----:com.apple.iTunes:local_ID")
             if isinstance(local_id, list) and local_id:
                 local_id = local_id[0]
@@ -4740,7 +4865,7 @@ def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_
                 lib_db_path=USER_DB_PATH
             )
             rewrite_tags(track_path, final_temp_tags)
-        logger.info("Final user DB update complete (user mode).")
+        logger.info("Final user database update complete (user mode).")
     else:
         conn = sqlite3.connect(DB_PATH)
         for (id_str, final_temp_tags, track_path) in newly_imported_tracks:
@@ -4758,7 +4883,7 @@ def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_
                 store_tags_in_db(DB_PATH, id_str, final_temp_tags, metadata_rev=new_rev)
                 rewrite_tags(track_path, final_temp_tags)
         conn.close()
-        logger.info("Final DB update complete (admin mode).")
+        logger.info("Final database update complete (admin mode).")
         if is_admin:
             if not latest_rev:
                 old_count_for_rev = 0
@@ -4768,9 +4893,63 @@ def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_
             new_count = get_total_track_count(DB_PATH)
             db_rev_val = next_db_revision(latest_rev if latest_rev else "", old_count_for_rev, new_count)
             store_db_revision(DB_PATH, db_rev_val)
-            logger.info(f"Updated db_rev='{db_rev_val}' due to DB changes.")
+            logger.info(f"Updated db_rev='{db_rev_val}' due to database changes.")
         else:
-            logger.info("No DB changes; db_rev not incremented.")
+            logger.info("No database changes; db_rev not incremented.")
+
+    # --- Assign spawnre (genre) info to each track and update database entries ---
+    logger.info("Assigning spawnre_tag to each track and updating database entries\n")
+    for idx, (track_path, track_tags, id_str) in enumerate(all_tracks):
+        if track_tags is None:
+            continue
+
+        def _tag_to_str(val):
+            if isinstance(val, list) and val:
+                val = val[0]
+            if isinstance(val, bytes):
+                val = val.decode("utf-8", errors="replace")
+            return str(val).strip() if val else ""
+
+        if is_admin:
+            # For admin mode, use the finalized per-artist top genre from artist_spawnre_tags.
+            artist_name = _tag_to_str(track_tags.get("©ART"))
+            artist_lower = artist_name.lower() if artist_name else ""
+            top_genre = artist_spawnre_tags.get(artist_lower, "")
+            if not top_genre:
+                logger.warning(f"No finalized top genre found for artist {artist_name} (track: {track_path}).")
+            # Store the top genre (as a single-item list) in the standard tag.
+            track_tags["©gen"] = [top_genre]
+            logger.info(f"Track: {track_path} | Artist: {artist_name} => Set ©gen to finalized top genre: '{top_genre}'")
+            rewrite_tags(track_path, track_tags)
+            store_tags_in_db(DB_PATH, id_str, track_tags,
+                             metadata_rev=track_tags.get("----:com.apple.iTunes:metadata_rev", "AAA"))
+        else:
+            # For user mode, re-fetch the spawnre data from the catalog DB and update ©gen.
+            spawn_id_val = _tag_to_str(track_tags.get("----:com.apple.iTunes:spawn_ID"))
+            if spawn_id_val:
+                db_tags = fetch_tags_from_db(spawn_id_val)
+                if db_tags and "----:com.apple.iTunes:spawnre" in db_tags:
+                    spawnre_value = db_tags.get("----:com.apple.iTunes:spawnre")
+                    if isinstance(spawnre_value, list) and spawnre_value:
+                        top_genre = spawnre_value[0]
+                    elif isinstance(spawnre_value, bytes):
+                        top_genre = spawnre_value.decode("utf-8", errors="replace").split(',')[0].strip()
+                    else:
+                        top_genre = str(spawnre_value).split(',')[0].strip()
+                    # Update the standard genre tag with only the top genre (as a single-item list)
+                    track_tags["©gen"] = [top_genre]
+                    logger.info(f"[User Mode] Updated ©gen tag to top spawnre genre: {top_genre} for track: {track_path}")
+                    rewrite_tags(track_path, track_tags)
+                    store_tags_in_db(DB_PATH, id_str, track_tags,
+                                     metadata_rev=track_tags.get("----:com.apple.iTunes:metadata_rev", "AAA"))
+                else:
+                    logger.info(f"[User Mode] No catalog spawnre found for spawn_id: {spawn_id_val} for track: {track_path}. Leaving tags unchanged.")
+                    rewrite_tags(track_path, track_tags)
+            else:
+                logger.info(f"[User Mode] No spawn_id available for track: {track_path}. Leaving tags unchanged.")
+                rewrite_tags(track_path, track_tags)
+
+    # Embeddings Generation
     if is_admin:
         for (track_path, track_tags) in all_tracks:
             if track_tags is None:
@@ -4991,1153 +5170,6 @@ def run_import(output_path, music_path, skip_prompts=False, keep_matched=False,
         if caffeinate_process is not None:
             caffeinate_process.terminate()
             logger.debug("Caffeinate terminated, allowing system to sleep.")
-
-# ###############################################################################
-# # Primary File Processor
-# ###############################################################################
-# def process_audio_files(
-#     input_dir,
-#     keep_matched=False,
-#     lastfm_api_key="",
-#     sp=None,
-#     is_admin=True,
-#     USER_DB_PATH=None,
-#     EMBED_PATH=None
-# ):
-#     """
-#     1. Gathers all .m4a/.mp4/.flac files under input_dir.
-#     2. Groups them by parent folder.
-#     3. For each folder => unify tags for year, check if single-artist/single-album => unify MB & Spotify lookups once,
-#        then proceed with normal repackage, rewrite tags, do spawn_id logic, do MBID/AcoustID per track (but skipping
-#        repeated MB/Spotify calls if they've already been assigned).
-#     4. finalize_spawnre_tags() => single best subgenre per artist.
-#     5. Assigns spawnre_tag => rename to "D-TT - title.m4a".
-#     6. If in admin mode, new spawn_ids or updated metadata get written to spawn_catalog.db, incrementing db_rev.
-#        If in user mode, new or updated tracks are written to spawn_library.db (lib_tracks/cat_tracks).
-#     7. Create symlinks for each imported track.
-#     8. Generate embeddings and M3U playlist.
-#     """
-
-#     # Ensure USER_DB_PATH is not None
-#     if USER_DB_PATH is None:
-#         raise ValueError("USER_DB_PATH (database path) must be provided.")
-
-#     global PLAYLISTS_DIR, spawn_id_to_embeds
-
-#     any_db_changes_ref = [False]  # store as list-of-bool so sub-functions can set it
-
-#     overridden_spawn_ids = set()
-#     donotupdate_spawn_ids = set()
-
-#     logger.info(f"Scanning for audio under '{input_dir}'")
-
-#     # For user mode, a user DB path is needed. In admin mode, only rely on DB_PATH (spawn_catalog.db).
-#     # If no USER_DB_PATH has been provided in user mode, raise an error or set a default.
-#     if not is_admin and not USER_DB_PATH:
-#         raise ValueError("User mode requires a valid USER_DB_PATH to spawn_library.db")
-
-#     # Step 1: Find all audio files
-#     audio_files = []
-#     for root, _, files in os.walk(input_dir):
-#         for f in files:
-#             # Skip any file that starts with '.' or '._'
-#             if f.startswith('.') or f.startswith('._'):
-#                 continue
-#             if f.lower().endswith(('.m4a', '.mp4', '.flac')):
-#                 full_path = os.path.join(root, f)
-#                 audio_files.append(full_path)
-
-#     if not audio_files:
-#         logger.info(f"No audio files found in '{input_dir}'")
-#         return
-
-#     # Step 2: Group by parent folder
-#     folder_map = defaultdict(list)
-#     for f in audio_files:
-#         parent_folder = os.path.abspath(os.path.dirname(f))
-#         folder_map[parent_folder].append(f)
-
-#     # Compute auxiliary directories once from OUTPUT_PARENT_DIR.
-#     # OUTPUT_PARENT_DIR is set to LIB_PATH/Spawn/Music
-#     lib_base = os.path.dirname(os.path.dirname(OUTPUT_PARENT_DIR))  # gets LIB_PATH
-#     spawn_root = os.path.join(lib_base, "Spawn")
-#     user_aux_dir = os.path.join(spawn_root, "aux", "user")
-#     alb_dir = os.path.join(user_aux_dir, "albm")    # Directory for album M3U playlists
-#     linx_dir = os.path.join(user_aux_dir, "linx")     # Directory for symlinks
-
-#     # Keep a list of (file_path, temp_tags) so that after finalize_spawnre_tags(),
-#     # 'spawnre_tag' can be assigned to each track, then rename files.
-#     all_tracks = []
-
-#     # Step 3: For each folder, unify year/artist/album if possible, then process each track and perform album-level RG & album art
-#     for folder, files_in_folder in folder_map.items():
-
-#         logger.info(
-#             "\n================================================================================================================\n"
-#             f"Processing album folder: {folder}\n"
-#         )
-#         cleaned_files_map = {}  # final_file_path -> temp_tags
-
-#         # Gather minimal tags (year, artist, album) for unify checks
-#         all_tags_by_file = {}
-#         year_by_file = {}
-#         artist_by_file = {}
-#         album_by_file = {}
-
-#         for file_path in files_in_folder:
-#             tmp_tags = extract_desired_tags(file_path)
-#             if not tmp_tags:
-#                 # If no tags, skip
-#                 continue
-#             all_tags_by_file[file_path] = tmp_tags
-
-#             # Extract year (first 4 digits)
-#             day_val = tmp_tags.get("©day", "")
-#             if isinstance(day_val, list) and day_val:
-#                 day_val = day_val[0]
-#             if isinstance(day_val, bytes):
-#                 day_val = day_val.decode("utf-8", errors="replace")
-#             year_str = str(day_val).strip()
-#             # possibly just first 4 digits
-#             if len(year_str) >= 4 and year_str[:4].isdigit():
-#                 year_str = year_str[:4]
-#             year_by_file[file_path] = year_str
-
-#             # artist
-#             art_val = tmp_tags.get("©ART", "")
-#             if isinstance(art_val, list) and art_val:
-#                 art_val = art_val[0]
-#             if isinstance(art_val, bytes):
-#                 art_val = art_val.decode("utf-8", errors="replace")
-#             art_str = (art_val or "Unknown").strip()
-#             artist_by_file[file_path] = art_str
-
-#             # album
-#             alb_val = tmp_tags.get("©alb", "")
-#             if isinstance(alb_val, list) and alb_val:
-#                 alb_val = alb_val[0]
-#             if isinstance(alb_val, bytes):
-#                 alb_val = alb_val.decode("utf-8", errors="replace")
-#             alb_str = (alb_val or "Unknown").strip()
-#             album_by_file[file_path] = alb_str
-
-#         # Gather minimal tags from each file in the folder
-#         # (already done: all_tags_by_file, year_by_file, etc.)
-#         # Now, if there is more than one track, count the years:
-#         unified_year = None
-#         if len(all_tags_by_file) > 1:
-#             # Count occurrences of each year
-#             unique_years = Counter(year_by_file[f] for f in all_tags_by_file)
-
-#             if len(unique_years) > 1:
-#                 logger.info(f"\n[ALBUM YEAR WARNING] Folder '{folder}' => mismatched year tags.\n")
-#                 logger.info("Years found and track counts:")
-#                 for y, cnt in unique_years.items():
-#                     logger.info(f"  {y}: {cnt} tracks")
-
-#                 # Find the most common year
-#                 most_common_year, most_common_count = unique_years.most_common(1)[0]
-
-#                 try:
-#                     most_common_int = int(most_common_year) if most_common_year.strip() else 0
-#                 except ValueError:
-#                     most_common_int = 0
-#                 # Check for a small percentage of pre-release tracks (1 year prior to album year)
-#                 pre_release_year = str(most_common_int - 1)  # Calculate the expected pre-release year
-#                 pre_release_count = unique_years.get(pre_release_year, 0)
-
-#                 total_tracks = sum(unique_years.values())
-
-#                 if pre_release_count > 0 and (pre_release_count / total_tracks) < 0.28:
-#                     # Auto-fix without prompting the user
-#                     logger.info(
-#                         f"\n[INFO] This album folder has mismatched years that appear to result simply from pre-release tracks.\n"
-#                         f"Assigning the album release year '{most_common_year}' to all output files in folder '{folder}'.\n"
-#                     )
-#                     unified_year = most_common_year
-#                 else:
-#                     user_in = input(
-#                         "\nThis album folder has mismatched years. If intentional, press 'y'.\n"
-#                         "Otherwise, type the correct 4-digit year for all tracks: "
-#                     ).strip().lower()
-#                     if user_in != "y" and len(user_in) == 4 and user_in.isdigit():
-#                         unified_year = user_in
-#                     else:
-#                         unified_year = most_common_year
-#             else:
-#                 # Only one unique year found (even if many files)
-#                 unified_year = next(iter(unique_years))
-#         else:
-#             # For a single file, use its year
-#             if all_tags_by_file:
-#                 unified_year = next(iter(year_by_file.values()))
-
-#             # Check if single artist + single album => do single MB/Spotify
-#             unique_artists = set(artist_by_file[f] for f in all_tags_by_file)
-#             unique_albums = set(album_by_file[f] for f in all_tags_by_file)
-
-#             if len(unique_artists) == 1 and len(unique_albums) == 1:
-#                 final_artist = list(unique_artists)[0]
-#                 final_album = list(unique_albums)[0]
-#                 logger.info(f"\n[ALBUM FOLDER] Found consistent artist='{final_artist}' "
-#                             f"and album='{final_album}' => attempting single MB/Spotify calls.")
-
-#                 # Single MB calls
-#                 artist_mbid = None
-#                 rg_mbid = None
-#                 try:
-#                     # search artists
-#                     artist_mbid = find_musicbrainz_artist_mbid(final_artist)
-#                 except:
-#                     pass
-
-#                 try:
-#                     # search release-group
-#                     rg_mbid = find_musicbrainz_rg_mbid(final_album, final_artist)
-#                 except:
-#                     pass
-
-#                 # Single Spotify calls
-#                 spotify_artist_id = None
-#                 spotify_album_id = None
-#                 try:
-#                     if sp:
-#                         spotify_artist_id = find_spotify_artist_id(final_artist, sp)
-#                 except:
-#                     pass
-
-#                 try:
-#                     if sp:
-#                         spotify_album_id = find_spotify_album_id(final_album, final_artist, sp)
-#                 except:
-#                     pass
-
-#                 # Assign them to each track
-#                 for fpath in all_tags_by_file:
-#                     tags = all_tags_by_file[fpath]
-#                     if artist_mbid:
-#                         tags["----:com.apple.iTunes:MusicBrainz Artist Id"] = artist_mbid
-#                     if rg_mbid:
-#                         tags["----:com.apple.iTunes:MusicBrainz Release Group Id"] = rg_mbid
-#                     if spotify_artist_id:
-#                         tags["----:com.apple.iTunes:spotify_artist_ID"] = spotify_artist_id
-#                     if spotify_album_id:
-#                         tags["----:com.apple.iTunes:spotify_album_ID"] = spotify_album_id
-#                     # optionally rewrite now, or let normal pipeline do it
-#                     rewrite_tags(fpath, tags)
-
-#         # Now proceed with normal track-level repackage + spawn_id logic, etc.
-#         # Because MBIDs/IDs have possibly been assigned already, track-level code can skip repeated lookups.
-
-#         for i, file_path in enumerate(files_in_folder, start=1):
-#             logger.info(
-#                 "\n===========\n"
-#                 f"  Track {i}/{len(files_in_folder)}: {file_path}\n"
-#             )
-
-#             # A. extract desired tags
-#             temp_tags = extract_desired_tags(file_path)
-#             if not temp_tags:
-#                 logger.info("    No desired tags found, skipping repackage.")
-#                 continue
-#             if unified_year:
-#                 temp_tags["©day"] = unified_year    # Override year if a unified_year was determined
-
-#             # B. Check if there's already a spawn_id; if not, create one
-#             spawn_id_tag = "----:com.apple.iTunes:spawn_ID"
-#             spawn_id_val = None
-
-#             if spawn_id_tag in temp_tags:
-#                 # existing spawn_id in incoming file
-#                 val_raw = temp_tags[spawn_id_tag]
-#                 if isinstance(val_raw, list) and val_raw:
-#                     val_raw = val_raw[0]
-#                 if isinstance(val_raw, bytes):
-#                     val_raw = val_raw.decode("utf-8", errors="replace")
-#                 spawn_id_val = str(val_raw).strip()
-#             else:
-#                 if is_admin:
-#                     # Partial match check in catalog database
-#                     with sqlite3.connect(DB_PATH) as temp_conn:
-#                         found_match = check_for_potential_match_in_db(
-#                             temp_conn,
-#                             temp_tags,
-#                             current_spawn_id=None,
-#                             similarity_threshold=0.90
-#                         )
-                    
-#                     if found_match:
-#                         logger.info("Admin mode: Found partial match in database.")
-#                         matched_id = fetch_matching_spawn_id_from_db(temp_tags)
-#                         if matched_id:
-#                             logger.info(f"Comparing metadata in matched spawn_id={matched_id}")
-#                             spawn_id_val = matched_id
-#                             # Optionally confirm or update the DB tags
-#                             # e.g. handle_existing_spawn_id(...) if you want to unify or prompt user
-#                         else:
-#                             logger.info("Could not retrieve the actual spawn_id row. Generating new id instead.")
-#                             spawn_id_val = generate_spawn_id()
-#                     else:
-#                         # No partial match => new spawn_id
-#                         spawn_id_val = generate_spawn_id()
-
-#                     # Set spawn_id in the track tags
-#                     temp_tags[spawn_id_tag] = spawn_id_val
-
-#                 else:
-#                     # Non-admin => user library logic
-#                     spawn_id_val = None
-
-#             # C. Detect format
-#             safe_file_path = shlex.quote(file_path)
-#             ffprobe_output = subprocess.getoutput(f"ffprobe -i {safe_file_path} 2>&1")
-#             format_type = detect_audio_format(ffprobe_output)
-
-#             # D. Determine final Artist/Album subfolder from tags
-#             def _decode_str(v):
-#                 if isinstance(v, list) and v:
-#                     v = v[0]
-#                 if isinstance(v, bytes):
-#                     v = v.decode("utf-8", errors="replace")
-#                 return str(v).strip() if v else ""
-
-#             artist_name = _decode_str(temp_tags.get("©ART")) or "Unknown"
-#             album_name  = _decode_str(temp_tags.get("©alb")) or "Unknown"
-
-#             artist_dir = sanitize_for_directory(artist_name)
-#             album_dir  = sanitize_for_directory(album_name)
-#             subpath    = os.path.join(artist_dir, album_dir)
-
-#             # Temporarily name the file "temp_XX.m4a" then rename it after track/disc # are confirmed 
-#             temp_filename = f"temp_{i:02d}.m4a"
-#             target_file   = os.path.join(OUTPUT_PARENT_DIR, subpath, temp_filename)
-#             os.makedirs(os.path.dirname(target_file), exist_ok=True)
-
-#             # E. Rewrite initial tags
-#             if format_type == "FLAC":
-#                 logger.info("    FLAC format detected => converting to ALAC (M4A) via ffmpeg...")
-#                 convert_flac_to_alac(file_path, target_file)
-#             elif format_type == "ALAC":
-#                 logger.info("    ALAC format detected => repackaging via ffmpeg...")
-#                 repackage_alac_file(file_path, target_file)
-#             elif format_type == "AAC":
-#                 logger.info("    AAC format detected => cleaning/repackaging via MP4Box...")
-#                 clean_or_repackage_aac(file_path, target_file)
-#             else:
-#                 logger.info("    Unknown format => attempt fallback repack as ALAC...")
-#                 repackage_alac_file(file_path, target_file)
-#             rewrite_tags(target_file, temp_tags)
-#             temp_tags = extract_desired_tags(target_file)
-
-#             # If is_admin => read/write from spawn_catalog.db.
-#             # If not is_admin => read from spawn_catalog.db, but write to user db.
-#             if spawn_id_val:
-#                 # Already in new file => see if it’s in the main catalog
-#                 db_tags = fetch_tags_from_db(spawn_id_val)  # Reads from spawn_catalog.db
-#                 #new_spawn_id = spawn_id_val  # Ensure it has a default value
-
-#                 if db_tags is not None:
-#                     # Existing track => handle conflict only if admin
-#                     if is_admin:
-#                         # Capture override ID if returned
-#                         new_id = handle_existing_spawn_id(
-#                             spawn_id_val,
-#                             db_tags,
-#                             temp_tags,
-#                             any_db_changes_ref,
-#                             target_file,
-#                             overridden_spawn_ids,
-#                             donotupdate_spawn_ids
-#                         )
-#                         # If the user chose "override," we must update spawn_id_val
-#                         if new_id and new_id != spawn_id_val:
-#                             logger.info(f"Track was overridden. Using new Spawn ID: {new_id}")
-#                             spawn_id_val = new_id
-#                             temp_tags[spawn_id_tag] = new_id
-#                     else:
-#                         # User mode => known catalog track => store updated tags in cat_tracks
-#                         temp_tags["----:com.apple.iTunes:metadata_rev"] = db_tags.get("----:com.apple.iTunes:metadata_rev", "AAA")
-#                         if not is_admin and not spawn_id_val and local_id:
-#                             spawn_id_val = local_id
-#                         store_tags_in_user_db(
-#                             spawn_id_val,
-#                             temp_tags,
-#                             metadata_rev=temp_tags["----:com.apple.iTunes:metadata_rev"],
-#                             table="cat_tracks",
-#                             lib_db_path=USER_DB_PATH
-#                         )
-#                 else:
-#                     # spawn_id_val exists but is not found in main DB => brand new track ID for admin or user
-#                     temp_tags["----:com.apple.iTunes:metadata_rev"] = "AAA"
-#                     if is_admin:
-#                         store_tags_in_db(DB_PATH, spawn_id_val, temp_tags, metadata_rev="AAA")
-#                         any_db_changes_ref[0] = True
-#                     else:
-#                         # No match found: do not store now; let the duplicate-checking phase handle it.
-#                         logger.info("[user] => No match found in spawn_catalog.db => leaving track without spawn_id for later processing.")
-
-#             ## If there was NO spawn_id in the file OR it was overridden:
-#             #if not spawn_id_val or new_spawn_id != spawn_id_val:
-
-#             # If there was NO spawn_id in the file:
-#             else:
-#                 if is_admin:
-#                     # Admin => generate a new spawn_id
-#                     new_id = generate_spawn_id()
-#                     logger.info(f"[admin] => Assigning new spawn_id: {new_id}\n")
-#                     temp_tags[spawn_id_tag] = new_id
-#                     temp_tags["----:com.apple.iTunes:metadata_rev"] = "AAA"
-
-#                     store_tags_in_db(DB_PATH, new_id, temp_tags, metadata_rev="AAA")
-#                     any_db_changes_ref[0] = True
-#                 else:
-#                     # USER MODE: Try to see if it matches an existing track in the main catalog.
-#                     with sqlite3.connect(DB_PATH) as temp_conn:
-#                         found_match = check_for_potential_match_in_db(temp_conn, temp_tags, current_spawn_id=None)
-#                     if found_match:
-#                         matched_id = fetch_matching_spawn_id_from_db(temp_tags)
-#                         if matched_id:
-#                             logger.info("[user] => Found a matching track in spawn_catalog.db. Using spawn_id=%s", matched_id)
-#                             temp_tags[spawn_id_tag] = matched_id
-#                             matched_db_tags = fetch_tags_from_db(matched_id)
-#                             if matched_db_tags:
-#                                 existing_rev = matched_db_tags.get("----:com.apple.iTunes:metadata_rev", "AAA")
-#                             else:
-#                                 existing_rev = "AAA"
-#                             temp_tags["----:com.apple.iTunes:metadata_rev"] = existing_rev
-#                             if not is_admin and not spawn_id and local_id:
-#                                 spawn_id = local_id
-#                             store_tags_in_user_db(
-#                                 spawn_id=matched_id,
-#                                 tag_dict=temp_tags,
-#                                 metadata_rev=existing_rev,
-#                                 table="cat_tracks",
-#                                 lib_db_path=USER_DB_PATH
-#                             )
-#                         else:
-#                             logger.info("[user] => Could not retrieve the actual spawn_id from the matched row; deferring insertion for duplicate-checking phase.")
-#                     else:
-#                         # No match found: defer insertion to duplicate-checking phase.
-#                         logger.info("[user] => No match found in spawn_catalog.db; deferring insertion for duplicate-checking.")
-
-#             # F. Confirm MBIDs + do AcoustID
-#             confirm_or_update_tags(temp_tags, target_file)
-
-#             if is_admin:
-
-#                 # G. If admin mode, confirm or update disc/track #
-#                 update_disc_and_track_numbers_from_mbz(temp_tags, any_db_changes_ref, target_file, spawn_id_val)
-
-#                 # H. Gather multiple genres from all sources:
-#                 def _tag_to_str(val):
-#                     if isinstance(val, list) and val:
-#                         val = val[0]
-#                     if isinstance(val, bytes):
-#                         val = val.decode("utf-8", errors="replace")
-#                     return str(val).strip() if val else ""
-
-#                 artist_name  = _tag_to_str(temp_tags.get("©ART"))
-#                 track_title  = _tag_to_str(temp_tags.get("©nam"))
-#                 embedded_gen = _tag_to_str(temp_tags.get("©gen"))
-
-#                 last_fm_genres = fetch_genre_lastfm(
-#                     artist_name,
-#                     track_title,
-#                     api_key=lastfm_api_key
-#                 )
-#                 spotify_genres = get_spotify_genres(artist_name, sp)
-#                 mb_genres      = get_musicbrainz_genres(artist_name)
-
-#                 if artist_name or track_title:
-#                     process_spawnre(
-#                         file_path=target_file,
-#                         artist_name=artist_name,
-#                         track_title=track_title,
-#                         embedded_genre=embedded_gen,
-#                         last_fm_genres=last_fm_genres,
-#                         spotify_genres=spotify_genres,
-#                         musicbrainz_genres=mb_genres,
-#                         temp_tags=temp_tags
-#                     )
-#             else:
-#                 # In user mode, pull spawnre-related metadata directly from the catalog database.
-
-#                 # Try to get spawn_id
-#                 spawn_id_val = temp_tags.get("----:com.apple.iTunes:spawn_ID")
-#                 if isinstance(spawn_id_val, list) and spawn_id_val:
-#                     spawn_id_val = spawn_id_val[0]
-#                 if isinstance(spawn_id_val, bytes):
-#                     spawn_id_val = spawn_id_val.decode("utf-8", errors="replace")
-#                 spawn_id_val = str(spawn_id_val).strip() if spawn_id_val else None
-
-#                 # Try to get local_id (or generate if missing)
-#                 local_id = temp_tags.get("----:com.apple.iTunes:local_ID")
-#                 if isinstance(local_id, list) and local_id:
-#                     local_id = local_id[0]
-#                 if isinstance(local_id, bytes):
-#                     local_id = local_id.decode("utf-8", errors="replace")
-#                 local_id = str(local_id).strip() if local_id else None
-
-#                 if not spawn_id_val and not local_id:
-#                     local_id = generate_local_id()
-#                     temp_tags["----:com.apple.iTunes:local_ID"] = [local_id.encode("utf-8")]
-#                     rewrite_tags(target_file, temp_tags)  # Persist new local_id
-
-#                 # Set fallback ID for rest of processing
-#                 id_str = spawn_id_val or local_id
-#                 if not id_str:
-#                     raise ValueError(f"No spawn_id or local_id available to track this file: {target_file}")
-
-#                 logger.info(f"[User Mode] Retrieving spawnre info from database for spawn_id: {spawn_id_val}")
-#                 db_tags = fetch_tags_from_db(spawn_id_val) if spawn_id_val else {}
-#                 if not db_tags:
-#                     logger.error(f"[User Mode] No database entry found for spawn_id: {spawn_id_val}")
-#                 else:
-#                     #logger.info(f"[User Mode] Found database entry for spawn_id: {spawn_id_val}. Keys: {list(db_tags.keys())}")
-#                     # Copy spawnre and spawnre_hex from DB into current track's tags.
-#                     for key in ["----:com.apple.iTunes:spawnre", "----:com.apple.iTunes:spawnre_hex"]:
-#                         if key in db_tags:
-#                             temp_tags[key] = db_tags[key]
-#                             logger.info(f"[User Mode] Set {key} to: {db_tags[key]}")
-#                         else:
-#                             logger.info(f"[User Mode] {key} not found in database entry.")
-#                     # Update the genre tag ("©gen") with the spawnre tag from the DB.
-#                     spawnre_tag = db_tags.get("----:com.apple.iTunes:spawnre", "")
-#                     if isinstance(spawnre_tag, bytes):
-#                         spawnre_tag = spawnre_tag.decode("utf-8", errors="replace")
-#                     if spawnre_tag:
-#                         temp_tags["©gen"] = spawnre_tag
-#                         logger.info(f"[User Mode] Set ©gen tag to spawnre_tag: {spawnre_tag}")
-#                     else:
-#                         logger.info("[User Mode] spawnre tag not found in database entry; leaving ©gen unchanged.")
-
-#             # J. Save final state into cleaned_files_map for album-level RG
-#             spawn_id_val_raw = temp_tags.get("----:com.apple.iTunes:spawn_ID")
-#             local_id_raw = temp_tags.get("----:com.apple.iTunes:local_ID")
-
-#             def _decode_id_field(raw):
-#                 if isinstance(raw, list) and raw:
-#                     raw = raw[0]
-#                 if isinstance(raw, bytes):
-#                     raw = raw.decode("utf-8", errors="replace")
-#                 return str(raw).strip() if raw else None
-
-#             spawn_id_val = _decode_id_field(spawn_id_val_raw)
-#             local_id = _decode_id_field(local_id_raw)
-
-#             id_str = spawn_id_val or local_id
-#             if not id_str:
-#                 logger.error(f"[ID ERROR] Could not resolve spawn_id or local_id in tags:\n{temp_tags}")
-#                 raise ValueError(f"No spawn_id or local_id available to track this file: {target_file}")
-#             cleaned_files_map[target_file] = temp_tags
-#             all_tracks.append((target_file, temp_tags, id_str))
-
-#         # After processing all tracks in this folder, handle album-level ReplayGain and album art
-#         if cleaned_files_map:
-#             run_replaygain_on_folder(cleaned_files_map, DB_PATH)
-
-#             # Fetch album art parameters from tags
-#             artist_name = temp_tags.get("©ART", ["Unknown"])[0] if isinstance(temp_tags.get("©ART"), list) else "Unknown"
-#             album_title = temp_tags.get("©alb", ["Unknown"])[0] if isinstance(temp_tags.get("©alb"), list) else "Unknown"
-#             def _tag_to_str(val):
-#                 if isinstance(val, list) and val:
-#                     val = val[0]
-#                 if isinstance(val, bytes):
-#                     val = val.decode("utf-8", errors="replace")
-#                 return str(val).strip() if val else ""
-#             spotify_track_id = _tag_to_str(temp_tags.get("----:com.apple.iTunes:spotify_track_ID"))
-#             musicbrainz_mbid = _tag_to_str(temp_tags.get("----:com.apple.iTunes:MusicBrainz Release Group Id"))
-
-#             logger.debug(f"Extracted Spotify Track ID: {spotify_track_id}")
-#             logger.debug(f"Extracted MusicBrainz Release Group MBID: {musicbrainz_mbid}")
-
-
-#             # Define the path for the album art in the output folder
-
-#             # 1) Decode from tags so we know final Artist & Album
-#             artist_name = _decode_str(temp_tags.get("©ART")) or "Unknown"
-#             album_name  = _decode_str(temp_tags.get("©alb")) or "Unknown"
-
-#             artist_dir = sanitize_for_directory(artist_name)
-#             album_dir  = sanitize_for_directory(album_name)
-
-#             # 2) Construct the exact final output folder (this is the destination for imported tracks)
-#             final_album_dir = os.path.join(OUTPUT_PARENT_DIR, artist_dir, album_dir)
-#             os.makedirs(final_album_dir, exist_ok=True)
-
-#             # 3) Define the path for cover art in the final album folder
-#             album_art_path = os.path.join(final_album_dir, "cover.jpg")
-
-#             # 4) Check for existing album art in the final album folder.
-#             if os.path.exists(album_art_path):
-#                 logger.info(f"Found existing album art at {album_art_path}. Using it for new tracks.")
-#                 # Embed this cover art into all tracks (if not already present)
-#                 for final_path, final_tags in cleaned_files_map.items():
-#                     embed_cover_art_into_file(final_path, album_art_path, final_tags)
-#             else:
-#                 logger.info(f"No cover.jpg found in {final_album_dir}; performing external album art lookup.")
-#                 # Here we pass final_album_dir as the album_folder to get_album_art.
-#                 album_art_url = get_album_art(
-#                     track_id=spotify_track_id,
-#                     mbid=musicbrainz_mbid,
-#                     client_id=SPOTIFY_CLIENT_ID,
-#                     client_secret=SPOTIFY_CLIENT_SECRET,
-#                     album_folder=final_album_dir
-#                 )
-
-#                 if album_art_url:
-#                     save_album_art(album_art_url, album_art_path)
-#                     for final_path, final_tags in cleaned_files_map.items():
-#                         embed_cover_art_into_file(final_path, album_art_path, final_tags)
-#                 else:
-#                     logger.info(f"No album art found for '{artist_name} - {album_name}'.")
-
-#             # Rewrite tags one last time with final ReplayGain data and album art
-#             for final_path, final_tags in cleaned_files_map.items():
-#                 rewrite_tags(final_path, final_tags)
-
-#     # Step 4: Finalize and print each artist's spawnre_tag
-#     finalize_spawnre_tags()
-
-#     # Step 5: Now that each artist's best subgenre is known, store spawnre_tag in each track if desired
-#     logger.info("Assigning spawnre_tag to each track")
-#     for (track_path, track_tags, _) in all_tracks:
-#         def _tag_to_str(val):
-#             if isinstance(val, list) and val:
-#                 val = val[0]
-#             if isinstance(val, bytes):
-#                 val = val.decode("utf-8", errors="replace")
-#             return str(val).strip() if val else None
-
-#         spotify_track_id = _tag_to_str(track_tags.get("----:com.apple.iTunes:spotify_track_ID"))
-#         musicbrainz_mbid = _tag_to_str(track_tags.get("----:com.apple.iTunes:MusicBrainz Release Group Id"))
-
-#         logger.debug(f"Extracted Spotify Track ID: {spotify_track_id}")
-#         logger.debug(f"Extracted MusicBrainz Release Group MBID: {musicbrainz_mbid}")
-
-#         artist_name = _tag_to_str(track_tags.get("©ART"))
-#         artist_lower = artist_name.lower() if artist_name else ""
-
-#         # In user mode, pull spawnre tag from the catalog if available.
-#         if not is_admin:
-#             spawn_id_val = track_tags.get("----:com.apple.iTunes:spawn_ID")
-#             if isinstance(spawn_id_val, list) and spawn_id_val:
-#                 spawn_id_val = spawn_id_val[0]
-#             if isinstance(spawn_id_val, bytes):
-#                 spawn_id_val = spawn_id_val.decode("utf-8", errors="replace")
-#             spawn_id_val = str(spawn_id_val).strip() if spawn_id_val else None
-
-#             db_tags = fetch_tags_from_db(spawn_id_val) if spawn_id_val else {}
-#             spawnre_tag = _tag_to_str(db_tags.get("©gen")) if "©gen" in db_tags else ""
-#         else:
-#             # In admin mode, calculate using the artist_spawnre_tags global dictionary.
-#             spawnre_tag = artist_spawnre_tags.get(artist_lower, "")
-
-#         # If there's a spawnre_tag, write it to the genre tag ("©gen")
-#         if spawnre_tag:
-#             track_tags["©gen"] = spawnre_tag
-#             logger.info(f"Track: {track_path}")
-#             logger.info(f"  Artist: {artist_name}")
-#             logger.info(f"  => spawnre_tag: '{spawnre_tag}'")
-#             rewrite_tags(track_path, track_tags)
-
-#     logger.info("Done assigning spawnre_tag to each track.\n")
-
-#     # Filename based on D-TT - title.m4a after all tags are fully updated.
-#     logger.info("=== Renaming files to D-TT [spawn_id] - title.m4a ===")
-
-#     for idx, (old_path, track_tags, id_str) in enumerate(all_tracks):
-
-#         # Extract disc number, track number, and title from tags:
-#         disc_tag = track_tags.get("disk")  # typically [(disc_main, disc_total)]
-#         track_tag = track_tags.get("trkn") # typically [(track_main, track_total)]
-
-#         disc_main = disc_tag[0][0] if (disc_tag and isinstance(disc_tag, list) and disc_tag) else 1
-#         track_main = track_tag[0][0] if (track_tag and isinstance(track_tag, list) and track_tag) else 0
-
-#         title_raw = track_tags.get("©nam")
-#         if isinstance(title_raw, list) and title_raw:
-#             title_raw = title_raw[0]
-#         if isinstance(title_raw, bytes):
-#             title_raw = title_raw.decode("utf-8", errors="replace")
-#         track_title_str = str(title_raw).strip() if title_raw else "untitled"
-
-#         spawn_id_str = id_str  # Already either spawn_id or local_id
-
-#         logger.info(f"Resolved spawn_id_str for {old_path}: {spawn_id_str}")
-
-#         # Build the new filename
-#         new_filename = build_d_tt_title_filename(
-#             disc_main,
-#             track_main,
-#             track_title_str,
-#             spawn_id_str=spawn_id_str
-#         )
-
-#         # Rename in the same directory
-#         old_dir = os.path.dirname(old_path)
-#         new_path = os.path.join(old_dir, new_filename)
-
-#         if os.path.abspath(old_path) != os.path.abspath(new_path):
-#             try:
-#                 os.rename(old_path, new_path)
-#                 logger.info(f"Renamed => {new_path}")
-#                 # Update the entry in all_tracks so the next loop references the correct path
-#                 all_tracks[idx] = (new_path, track_tags, id_str)
-
-#             except OSError as e:
-#                 logger.warning(f"Unable to rename file: {e}")
-#         else:
-#             logger.debug(f"File already named {new_path}, skipping rename.")
-
-#     # Skip any mid-pipeline database insertion to avoid partial/inconsistent data.
-
-#     logger.info("All files renamed to D-TT [spawn_id] - title.m4a format.\n")
-
-#     logger.info("=== Duplicate-checking phase: Saving final track tags to database ===")
-
-#     # Open the main catalog DB for duplicate checking.
-#     if is_admin:
-#         latest_rev = get_latest_db_rev(DB_PATH)
-#         logger.info(f"Current database revision is {latest_rev}\n")
-#         conn = sqlite3.connect(DB_PATH)
-#         old_count = get_total_track_count(DB_PATH)
-#     else:
-#         conn = sqlite3.connect(DB_PATH)
-#         old_count = get_total_track_count(DB_PATH)
-#         latest_rev = None  # no concept of db_rev for user library
-
-#     newly_imported_tracks = []
-
-#     # 1) Final pass: re-extract tags and force rewriting to ensure consistency.
-#     for (track_path, _, _) in all_tracks:
-#         final_temp_tags = extract_desired_tags(track_path)
-#         if not final_temp_tags:
-#             logger.info(f"  No desired tags found in final pass: {track_path}")
-#             continue
-#         rewrite_tags(track_path, final_temp_tags)
-#         logger.debug(f"Final tags for {track_path}: {final_temp_tags}")
-
-#     logger.info("Done final pass. All tags are now forced through rewrite_tags logic.")
-
-#     # 2) Process each track for insertion.
-#     for idx, (track_path, _, _) in enumerate(all_tracks):
-#         final_temp_tags = extract_desired_tags(track_path)
-#         if not final_temp_tags:
-#             logger.info(f"No tags found for database insertion: {track_path}")
-#             continue
-
-#         # Attempt to extract spawn_id from the tags.
-#         spawn_id_data = final_temp_tags.get("----:com.apple.iTunes:spawn_ID")
-#         if isinstance(spawn_id_data, list) and spawn_id_data:
-#             spawn_id_data = spawn_id_data[0]
-#         if isinstance(spawn_id_data, bytes):
-#             spawn_id_data = spawn_id_data.decode("utf-8", errors="replace")
-#         spawn_id_str = str(spawn_id_data).strip() if spawn_id_data else None
-
-#         if spawn_id_str:
-#             if not keep_matched:
-#                 logger.info(f"Track {track_path} has spawn_id '{spawn_id_str}' but KEEP_MATCHED is False. Removing file.")
-#                 # Compute relative path under OUTPUT_PARENT_DIR.
-#                 relative_path = os.path.relpath(track_path, start=OUTPUT_PARENT_DIR)
-#                 base_no_ext, _ = os.path.splitext(relative_path)
-#                 # Build target path for a .txt placeholder.
-#                 licn_root = os.path.join(os.path.dirname(OUTPUT_PARENT_DIR), "aux", "user", "licn")
-#                 new_txt_path = os.path.join(licn_root, base_no_ext + ".txt")
-#                 os.makedirs(os.path.dirname(new_txt_path), exist_ok=True)
-#                 try:
-#                     with open(new_txt_path, "w", encoding="utf-8") as f:
-#                         f.write("")
-#                     logger.info(f"Blank txt file created => {new_txt_path}")
-#                     os.remove(track_path)
-#                     logger.info(f"Removed file: {track_path}")
-#                 except Exception as e:
-#                     logger.warning(f"Error handling file {track_path}: {e}")
-#                 all_tracks[idx] = (new_txt_path, None, spawn_id_str)
-#                 continue
-#             else:
-#                 newly_imported_tracks.append((spawn_id_str, final_temp_tags, track_path))
-#         else:
-#             # No spawn_id found: attempt to get the local_id from the tags.
-#             local_id = final_temp_tags.get("----:com.apple.iTunes:local_ID")
-#             if isinstance(local_id, list) and local_id:
-#                 local_id = local_id[0]
-#             if isinstance(local_id, bytes):
-#                 local_id = local_id.decode("utf-8", errors="replace")
-#             local_id = str(local_id).strip() if local_id else ""
-#             if not local_id:
-#                 local_id = generate_local_id()
-#                 final_temp_tags["----:com.apple.iTunes:local_ID"] = [local_id.encode("utf-8")]
-#                 rewrite_tags(track_path, final_temp_tags)
-#                 final_temp_tags = extract_desired_tags(track_path)
-#             logger.info(f"No spawn_id found for {track_path}. Using local_id: {local_id}")
-#             newly_imported_tracks.append((local_id, final_temp_tags, track_path))
-#             # Update the in-memory entry so later steps see the local_id.
-#             all_tracks[idx] = (track_path, final_temp_tags, local_id)
-
-#     conn.close()
-
-#     logger.info(f"Newly imported tracks count: {len(newly_imported_tracks)}")
-#     new_total = old_count + len(newly_imported_tracks)
-
-#     # Insert into the appropriate database table.
-#     if not is_admin:
-#         # USER MODE: Store entries in the user library database ("lib_tracks").
-#         for (id_str, final_temp_tags, track_path) in newly_imported_tracks:
-#             store_tags_in_user_db(
-#                 spawn_id=id_str,
-#                 tag_dict=final_temp_tags,
-#                 metadata_rev=final_temp_tags.get("----:com.apple.iTunes:metadata_rev", "AAA"),
-#                 table="lib_tracks",
-#                 lib_db_path=USER_DB_PATH
-#             )
-#             rewrite_tags(track_path, final_temp_tags)
-#         logger.info("Final user database update complete (user mode). No revision logic applied.\n")
-#     else:
-#         # ADMIN MODE: Update the main catalog database.
-#         conn = sqlite3.connect(DB_PATH)
-#         for (id_str, final_temp_tags, track_path) in newly_imported_tracks:
-#             db_tags = fetch_tags_from_db(id_str)
-#             if db_tags is None:
-#                 if "----:com.apple.iTunes:metadata_rev" not in final_temp_tags:
-#                     final_temp_tags["----:com.apple.iTunes:metadata_rev"] = "AAA"
-#                 store_tags_in_db(DB_PATH, id_str, final_temp_tags,
-#                                  metadata_rev=final_temp_tags["----:com.apple.iTunes:metadata_rev"])
-#                 rewrite_tags(track_path, final_temp_tags)
-#             else:
-#                 old_rev = db_tags.get("----:com.apple.iTunes:metadata_rev", "AAA")
-#                 new_rev = final_temp_tags.get("----:com.apple.iTunes:metadata_rev", old_rev)
-#                 final_temp_tags["----:com.apple.iTunes:metadata_rev"] = new_rev
-#                 store_tags_in_db(DB_PATH, id_str, final_temp_tags, metadata_rev=new_rev)
-#                 rewrite_tags(track_path, final_temp_tags)
-#         conn.close()
-#         logger.info("Final database update complete (admin mode).\n")
-#         if any_db_changes_ref[0]:
-#             if not latest_rev:
-#                 old_count_for_rev = 0
-#             else:
-#                 parts = latest_rev.split(".")
-#                 old_count_for_rev = int(parts[1]) if len(parts) > 1 else 0
-#             new_count = get_total_track_count(DB_PATH)
-#             db_rev_val = next_db_revision(latest_rev if latest_rev else "", old_count_for_rev, new_count)
-#             store_db_revision(DB_PATH, db_rev_val)
-#             logger.info(f"Using db_rev='{db_rev_val}' since DB changed.")
-#         else:
-#             logger.info("No DB changes => db_rev not incremented.")
-
-#     if is_admin:
-#         # Generate embeddings for each track that ended up with a valid spawn_id
-#         for (track_path, track_tags) in all_tracks:
-#             if track_tags is None:
-#                 continue
-#             # First, extract the spawn ID from the track's tags.
-#             spawn_id_data = track_tags.get("----:com.apple.iTunes:spawn_ID")
-#             if isinstance(spawn_id_data, list) and spawn_id_data:
-#                 spawn_id_data = spawn_id_data[0]
-#             if isinstance(spawn_id_data, bytes):
-#                 spawn_id_data = spawn_id_data.decode("utf-8", errors="replace")
-#             spawn_id_str = str(spawn_id_data).strip() if spawn_id_data else None
-
-#             # Now check if this spawn ID is flagged in the donotupdate set.
-#             if spawn_id_str in donotupdate_spawn_ids:
-#                 logger.info(f"Skipping embedding generation for spawn_id={spawn_id_str} because user chose NOT to update.")
-#                 continue
-
-#             if spawn_id_str:
-#                 generate_deejai_embedding_for_track(track_path, spawn_id_str)
-#             else:
-#                 logger.info(f"[MP4ToVec] No spawn_id found for track: {track_path}; skipping embedding.")
-
-#         # Append newly generated embeddings to the pickle file
-#         if spawn_id_to_embeds:
-#             logger.info(f"[MP4ToVec] Attempting to save/merge {len(spawn_id_to_embeds)} new embeddings.")
-#             save_combined_embeddings(EMBED_PATH, spawn_id_to_embeds)
-            
-#             # optionally clear the in-memory dictionary if you want
-#             spawn_id_to_embeds.clear()
-
-#     else:
-#         # User mode: Generate embeddings for tracks that have a local_id
-#         for (track_path, track_tags, id_str) in all_tracks:
-#             if track_tags is None:
-#                 continue
-#             # Extract the local_id from the track's tags.
-#             local_id_data = track_tags.get("----:com.apple.iTunes:local_ID")
-#             if isinstance(local_id_data, list) and local_id_data:
-#                 local_id_data = local_id_data[0]
-#             if isinstance(local_id_data, bytes):
-#                 local_id_data = local_id_data.decode("utf-8", errors="replace")
-#             local_id_str = str(local_id_data).strip() if local_id_data else None
-
-#             if local_id_str:
-#                 generate_deejai_embedding_for_track(track_path, local_id_str)
-#                 # Transfer the embedding from the global dictionary to local_user_embeddings.
-#                 if local_id_str in spawn_id_to_embeds:
-#                     local_user_embeddings[local_id_str] = spawn_id_to_embeds.pop(local_id_str)
-#             else:
-#                 logger.info(f"[MP4ToVec] No local_id found for track: {track_path}; skipping embedding.")
-
-#         # Determine the output path for user-mode (local) embeddings.
-#         # Assuming OUTPUT_PARENT_DIR is LIB_PATH/Spawn/Music, then LIB_PATH is two levels up.
-#         lib_path = os.path.dirname(os.path.dirname(OUTPUT_PARENT_DIR))
-#         user_embed_path = os.path.join(lib_path, "Spawn", "aux", "user", "mp4tovec_local.p")
-#         if local_user_embeddings:
-#             logger.info(f"[MP4ToVec] Attempting to save/merge {len(local_user_embeddings)} new local embeddings.")
-#             save_combined_embeddings(user_embed_path, local_user_embeddings)
-#             local_user_embeddings.clear()
-
-#     # Create symlinks for imported tracks
-#         # Derive the library base path from OUTPUT_PARENT_DIR.
-#         # OUTPUT_PARENT_DIR is set to: LIB_PATH/Spawn/Music, so:
-#     lib_base = os.path.dirname(os.path.dirname(OUTPUT_PARENT_DIR))
-#     logger.info("Creating symlinks for imported tracks...")
-#     linx_dir = os.path.join(lib_base, "Spawn", "aux", "user", "linx")
-#     os.makedirs(linx_dir, exist_ok=True)
-
-#     for (track_path, track_tags, id_str) in all_tracks:
-#         if track_tags is None:
-#             continue
-#         if id_str:
-#             create_symlink_for_track(track_path, lib_base, id_str)
-#         else:
-#             logger.warning(f"No spawn_id or local_id found for track {track_path}; skipping symlink creation.")
-
-#     # Generate album M3U playlists for newly imported album folders
-#     logger.info("\n")
-#     logger.info("Generating album M3U playlists for newly imported albums...")
-#     album_folders = set()
-#     for (track_path, track_tags, id_str) in all_tracks:
-#         if track_tags is None:
-#             continue
-#         # Determine the album folder from the track_path.
-#         album_folder = os.path.dirname(track_path)
-#         album_folders.add(album_folder)
-
-#     for album_folder in album_folders:
-#         logger.info(f"Ensuring album M3U includes all tracks for: {album_folder}")
-
-#         # Scan for all existing symlinks in linx_dir that belong to this album
-#         existing_symlinks = set()
-#         if os.path.exists(linx_dir):
-#             for symlink in os.listdir(linx_dir):
-#                 symlink_path = os.path.join(linx_dir, symlink)
-#                 if os.path.islink(symlink_path):
-#                     target_path = os.path.realpath(symlink_path)
-#                     # Ensure it belongs to the current album folder
-#                     if os.path.dirname(target_path) == album_folder:
-#                         existing_symlinks.add(symlink_path)
-
-#         # Generate the playlist with both new and existing tracks
-#         logger.info(f"Checking symlinks in {linx_dir} for album '{album_folder}'")
-#         symlink_files = [f for f in os.listdir(linx_dir) if f.endswith('.m4a')]
-#         #logger.info(f"Found {len(symlink_files)} symlinked tracks: {symlink_files}")
-#         #logger.info(f"Found {len(symlink_files)} symlinked tracks.")
-#         generate_playlist_for_album(album_folder, linx_dir, alb_dir, use_absolute_paths=False)
-
-#     # M3U generation
-#     logger.info("=== Creating M3U playlist of newly imported tracks that aren't already in spawn_catalog.db ===")
-
-#     base_music_dir = os.path.abspath(OUTPUT_PARENT_DIR)
-#     generate_import_playlist(all_tracks, base_music_dir, PLAYLISTS_DIR)
-
-#     # Now remove any empty directories from Spawn/Music
-#     music_root = os.path.abspath(OUTPUT_PARENT_DIR)  # e.g. "…/Spawn/Music"
-#     remove_empty_music_dirs(music_root)
-#     #logger.info("Done removing empty subdirectories from Spawn/Music.")
-
-
-
-# ###############################################################################
-# # Importer Logic
-# ###############################################################################
-
-# def run_import(
-#     output_path,
-#     music_path,
-#     skip_prompts=False,
-#     keep_matched=False,
-#     acoustid_key=None,
-#     spotify_client_id=None,
-#     spotify_client_secret=None,
-#     lastfm_key=None,
-#     is_admin=False
-# ):
-#     """
-#     If API keys are read from environment (APId.env), don't prompt to save them again.
-#     If the user entered keys via CLI (or passed them directly into run_import()), 
-#     then prompt user to save to APId.env unless skip_prompts=True.
-
-#     :param output_path: folder where 'Spawn' will be placed
-#     :param music_path: folder containing the input music
-#     :param acoustid_key: optional AcoustID API Key
-#     :param spotify_client_id: optional Spotify Client ID
-#     :param spotify_client_secret: optional Spotify Client Secret
-#     :param lastfm_key: optional Last.fm API Key
-#     :param skip_prompts: if True, skip interactive input() prompts
-#     :param is_admin: if True, we write new or updated tracks to spawn_catalog.db;
-#                      if False, we write them to the user’s spawn_library.db
-#                      (but still read from spawn_catalog.db for matching).
-#     """
-#     global SKIP_PROMPTS
-#     SKIP_PROMPTS = skip_prompts
-
-#     global KEEP_MATCHED
-#     KEEP_MATCHED = keep_matched
-
-#     global OUTPUT_PARENT_DIR, LOG_DIR, LOG_FILE, DB_PATH, PLAYLISTS_DIR
-#     global ACOUSTID_API_KEY, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, DEFAULT_LASTFM_API_KEY
-#     global DEBUG_MODE
-#     global MP4TOVEC_MODEL
-#     global spawn_id_to_embeds, local_user_embeddings
-
-#     # Expand the output path
-#     expanded_out = os.path.expanduser(output_path)
-#     OUTPUT_PARENT_DIR = os.path.join(expanded_out, "Spawn", "Music")
-#     LOG_DIR = os.path.join(expanded_out, "Spawn", "aux", "temp")
-#     LOG_FILE = os.path.join(LOG_DIR, "log.txt")
-#     PLAYLISTS_DIR = os.path.join(expanded_out, "Spawn", "Playlists")
-#     GLOB_DIR = os.path.join(expanded_out, "Spawn", "aux", "glob")
-#     USER_DIR = os.path.join(expanded_out, "Spawn", "aux", "user")
-#     EMBED_PATH = os.path.join(GLOB_DIR, "mp4tovec.p")
-
-#     os.makedirs(LOG_DIR, exist_ok=True)
-#     os.makedirs(PLAYLISTS_DIR, exist_ok=True)
-#     os.makedirs(GLOB_DIR, exist_ok=True)
-#     os.makedirs(USER_DIR, exist_ok=True)
-
-#     # Main catalog DB path
-#     DB_PATH = os.path.join(GLOB_DIR, "spawn_catalog.db")
-
-#     # In user mode, also define a user library DB path
-#     USER_DB_PATH = os.path.join(USER_DIR, "spawn_library.db")  # e.g. "…/Spawn/aux/user/spawn_library.db"
-
-#     # Initialize logging
-#     setup_logging(debug_to_console=DEBUG_MODE, log_file=LOG_FILE)
-
-#     # Validate input dir
-#     if not os.path.isdir(music_path):
-#         logger.info(f"Error: {music_path} is not a valid directory.")
-#         sys.exit(1)  # or raise an Exception
-
-#     # ENV file loading
-#     env_path = os.path.join(os.path.dirname(__file__), "APId.env")
-#     load_dotenv(env_path)
-
-#     # Handle API credentials
-
-#     just_entered_acoustid = False
-#     just_entered_lastfm = False
-#     just_entered_spotify = False
-
-#     # AcoustID
-#     if acoustid_key:
-#         ACOUSTID_API_KEY = acoustid_key
-#         just_entered_acoustid = True
-#     else:
-#         ACOUSTID_API_KEY = os.environ.get("ACOUSTID_API_KEY", "")
-#     if not ACOUSTID_API_KEY and not skip_prompts:
-#         ACOUSTID_API_KEY = input("Enter AcoustID API Key: ").strip()
-#         if ACOUSTID_API_KEY:
-#             just_entered_acoustid = True
-
-#     # Last.FM
-#     if lastfm_key:
-#         DEFAULT_LASTFM_API_KEY = lastfm_key
-#         just_entered_lastfm = True
-#     else:
-#         DEFAULT_LASTFM_API_KEY = os.environ.get("LASTFM_API_KEY", "")
-#     if not DEFAULT_LASTFM_API_KEY and not skip_prompts:
-#         DEFAULT_LASTFM_API_KEY = input("Enter Last.FM API Key: ").strip()
-#         if DEFAULT_LASTFM_API_KEY:
-#             just_entered_lastfm = True
-
-#     # Spotify
-#     if spotify_client_id:
-#         SPOTIFY_CLIENT_ID = spotify_client_id
-#         just_entered_spotify = True
-#     else:
-#         SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
-#     if spotify_client_secret:
-#         SPOTIFY_CLIENT_SECRET = spotify_client_secret
-#         just_entered_spotify = True
-#     else:
-#         SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
-#     if not SPOTIFY_CLIENT_ID and not skip_prompts:
-#         SPOTIFY_CLIENT_ID = input("Enter Spotify Client ID: ").strip()
-#         if SPOTIFY_CLIENT_ID:
-#             just_entered_spotify = True
-#     if not SPOTIFY_CLIENT_SECRET and not skip_prompts:
-#         SPOTIFY_CLIENT_SECRET = input("Enter Spotify Client Secret: ").strip()
-#         if SPOTIFY_CLIENT_SECRET:
-#             just_entered_spotify = True
-
-#     # Offer to save to APId.env if input keys are non-empty
-#     if not skip_prompts:
-#         if just_entered_acoustid and ACOUSTID_API_KEY:
-#             ans = get_user_input("Do you want to save ACOUSTID_API_KEY to APId.env? ([y]/n): ", default="y")
-#             if ans.lower() != "n":
-#                 store_key_in_env_file(env_path, "ACOUSTID_API_KEY", ACOUSTID_API_KEY)
-
-#         if just_entered_lastfm and DEFAULT_LASTFM_API_KEY:
-#             ans = get_user_input("Do you want to save LASTFM_API_KEY to APId.env? ([y]/n): ", default="y")
-#             if ans.lower() != "n":
-#                 store_key_in_env_file(env_path, "LASTFM_API_KEY", DEFAULT_LASTFM_API_KEY)
-
-#         if just_entered_spotify and SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
-#             ans = get_user_input("Do you want to save Spotify credentials to APId.env? ([y]/n): ", default="y")
-#             if ans.lower() != "n":
-#                 store_key_in_env_file(env_path, "SPOTIFY_CLIENT_ID", SPOTIFY_CLIENT_ID)
-#                 store_key_in_env_file(env_path, "SPOTIFY_CLIENT_SECRET", SPOTIFY_CLIENT_SECRET)
-
-
-#     # Initialize the main catalog DB to read from it (and admin writes to it)
-#     init_db(DB_PATH)
-#     init_db_revisions(DB_PATH)
-
-#     # If user mode, also init user library DB
-#     if not is_admin:
-#         init_user_library_db(USER_DB_PATH)
-
-#     # Create Spotify client
-#     sp = spotipy.Spotify(
-#         auth_manager=SpotifyClientCredentials(
-#             client_id=SPOTIFY_CLIENT_ID,
-#             client_secret=SPOTIFY_CLIENT_SECRET
-#         )
-#     )
-
-#     # Deej-AI / MP4ToVec => Attempt to load the MP4ToVec model
-#     global MP4TOVEC_AVAILABLE
-#     if MP4TOVEC_AVAILABLE:
-#         try:
-#             MP4TOVEC_MODEL = load_mp4tovec_model_diffusion()
-#             #MP4TOVEC_MODEL = load_mp4tovec_model_torch()
-#             #MP4TOVEC_MODEL = load_mp4tovec_model_tf()
-#             # Check if it's actually a placeholder lambda (or None)
-#             if (callable(MP4TOVEC_MODEL) 
-#                 and getattr(MP4TOVEC_MODEL, "__name__", "") == "<lambda>"):
-#                 logger.warning("[MP4ToVec] Placeholder model in use (no real load code).")
-#             elif MP4TOVEC_MODEL is None:
-#                 logger.warning("[MP4ToVec] Model is None; using placeholder or disabled.")
-#             else:
-#                 logger.info("[MP4ToVec] Model loaded successfully.")
-#         except Exception as e:
-#             MP4TOVEC_MODEL = None
-#             MP4TOVEC_AVAILABLE = False
-#             logger.warning(f"[MP4ToVec] Could not load model: {e}")
-#     else:
-#         logger.warning("[MP4ToVec] MP4ToVec not imported; embeddings won't be generated.")
-
-#     # Finally call "process_audio_files" (the big pipeline)
-#     process_audio_files(
-#         input_dir=music_path,
-#         keep_matched=KEEP_MATCHED,
-#         lastfm_api_key=DEFAULT_LASTFM_API_KEY,
-#         sp=sp,
-#         is_admin=is_admin,
-#         USER_DB_PATH=USER_DB_PATH,
-#         EMBED_PATH=EMBED_PATH
-#     )
 
 
 
