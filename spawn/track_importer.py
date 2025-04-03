@@ -501,6 +501,31 @@ def fallback_json_serializer(obj):
     return str(obj)
 
 
+def normalize_fields_to_lists(tag_dict, fields_to_listify=None):
+    """
+    Ensure specified fields in tag_dict are lists, even if currently strings.
+    """
+    default_fields = [
+        "artist", "albumartist", "genre",
+        "metadata_rev",
+        "----:com.apple.iTunes:metadata_rev",
+        "----:com.apple.iTunes:Acoustid Id",
+        "----:com.apple.iTunes:Acoustid Fingerprint",
+        "----:com.apple.iTunes:replaygain_album_gain",
+        "----:com.apple.iTunes:replaygain_album_peak",
+        "----:com.apple.iTunes:replaygain_track_gain",
+        "----:com.apple.iTunes:replaygain_track_peak",
+        "----:com.apple.iTunes:spawnre_hex",
+    ]
+    if fields_to_listify is None:
+        fields_to_listify = default_fields
+
+    for field in fields_to_listify:
+        if field in tag_dict and not isinstance(tag_dict[field], list):
+            tag_dict[field] = [tag_dict[field]]
+    return tag_dict
+
+
 def store_tags_in_user_db(spawn_id, tag_dict, metadata_rev=None, table="lib_tracks", lib_db_path=None):
     """
     Insert or replace a row in either 'lib_tracks' or 'cat_tracks' table
@@ -587,6 +612,7 @@ def store_tags_in_user_db(spawn_id, tag_dict, metadata_rev=None, table="lib_trac
 
     # 1) Convert the entire dictionary
     decoded_dict = universal_decode(tag_dict)
+    decoded_dict = normalize_fields_to_lists(decoded_dict)
 
     # Ensure the final result is a dict
     if not isinstance(decoded_dict, dict):
@@ -595,6 +621,9 @@ def store_tags_in_user_db(spawn_id, tag_dict, metadata_rev=None, table="lib_trac
                        "Wrapping it in a dict under key 'original_value'.")
         decoded_dict = {"original_value": decoded_dict}
 
+    # 2) Ensure JSON metadata_rev matches embedded tag
+    if "----:com.apple.iTunes:metadata_rev" in decoded_dict:
+        decoded_dict["metadata_rev"] = decoded_dict["----:com.apple.iTunes:metadata_rev"]
     # # 2) Inject metadata_rev if provided
     # if metadata_rev:
     #     clean_rev = universal_decode(metadata_rev)
@@ -706,6 +735,7 @@ def store_tags_in_db(DB_PATH, spawn_id, tag_dict, metadata_rev=None):
 
     # 1) Convert the entire dictionary
     decoded_dict = universal_decode(tag_dict)
+    decoded_dict = normalize_fields_to_lists(decoded_dict)
 
     # Ensure the final result is a dict
     if not isinstance(decoded_dict, dict):
@@ -715,10 +745,13 @@ def store_tags_in_db(DB_PATH, spawn_id, tag_dict, metadata_rev=None):
         )
         decoded_dict = {"original_value": decoded_dict}
 
-    # 2) Inject metadata_rev if provided
-    if metadata_rev:
-        clean_rev = universal_decode(metadata_rev)
-        decoded_dict["metadata_rev"] = clean_rev
+    # 2) Ensure JSON metadata_rev matches embedded tag
+    if "----:com.apple.iTunes:metadata_rev" in decoded_dict:
+        decoded_dict["metadata_rev"] = decoded_dict["----:com.apple.iTunes:metadata_rev"]
+    # # 2) Inject metadata_rev if provided
+    # if metadata_rev:
+    #     clean_rev = universal_decode(metadata_rev)
+    #     decoded_dict["metadata_rev"] = clean_rev
 
     # 3) JSON serialize the cleaned data
     tag_data_json = json.dumps(decoded_dict, ensure_ascii=False, sort_keys=True, default=fallback_json_serializer)
@@ -1444,6 +1477,31 @@ def normalize_genre(
 
     final_genre_name = genre_mapping[matched_code]["Genre"]
     return final_genre_name.lower()
+
+
+def normalize_spawnre(tags):
+    """
+    Ensures that the '----:com.apple.iTunes:spawnre' field in the tags dictionary
+    is stored as a list of strings. If it is a comma‐separated string or bytes,
+    it will split and strip it.
+    """
+    key = "----:com.apple.iTunes:spawnre"
+    if key in tags:
+        value = tags[key]
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
+        if isinstance(value, str):
+            # Split by commas and strip each element; filter out any empty strings
+            tags[key] = [s.strip() for s in value.split(",") if s.strip()]
+        elif isinstance(value, list):
+            # Ensure each element is a string (decode bytes if necessary)
+            new_list = []
+            for item in value:
+                if isinstance(item, bytes):
+                    new_list.append(item.decode("utf-8", errors="replace").strip())
+                else:
+                    new_list.append(str(item).strip())
+            tags[key] = new_list
 
 
 def combine_and_prioritize_genres_refined(
@@ -2887,6 +2945,7 @@ def update_album_rg_for_spawn_id(DB_PATH, spawn_id, album_gain, album_peak):
                 logger.warning(f"Error bumping metadata_rev: {e}")
                 new_rev = old_rev
             tags["----:com.apple.iTunes:metadata_rev"] = [new_rev]
+            tags["metadata_rev"] = [new_rev]
 
             new_json = json.dumps(tags, ensure_ascii=False, sort_keys=True)
             cursor.execute("UPDATE tracks SET tag_data = ? WHERE spawn_id = ?", (new_json, spawn_id))
@@ -2901,13 +2960,25 @@ def update_album_rg_for_spawn_id(DB_PATH, spawn_id, album_gain, album_peak):
         logger.info(f"Error updating DB for spawn_id {spawn_id}: {e}")
 
 
-def run_replaygain_on_folder(cleaned_files_map, DB_PATH):
+def is_catalog_match(spawn_id):
+    """
+    Helper: returns True if the spawn_id indicates a matched catalog track.
+    For example, if spawn_id does not start with "xxx", it is considered a catalog match.
+    Adjust this logic as needed.
+    """
+    return isinstance(spawn_id, str) and not spawn_id.startswith("xxx")
+
+
+def run_replaygain_on_folder(cleaned_files_map, DB_PATH, mode="admin", lib_db_path=None):
     """
     Uses `rsgain easy <folder>` to do a multi-track album scan on all cleaned files
     in that folder, ensuring previously existing tracks are also included.
     Parses the output lines to extract track-level and album-level gain/peak values,
-    then updates each file's temp_tags. After updating, it calls store_tags_in_db
-    for each track to update the spawn_catalog.db with the new album ReplayGain values.
+    then updates each file's temp_tags.
+
+    In admin mode, for each track it calls update_album_rg_for_spawn_id() to update the
+    spawn_catalog.db entry. In user mode, it updates the appropriate table in the
+    spawn_library.db (either 'cat_tracks' or 'lib_tracks') and does not modify spawn_catalog.db.
 
     'cleaned_files_map' is:
         {
@@ -2916,16 +2987,12 @@ def run_replaygain_on_folder(cleaned_files_map, DB_PATH):
           ...
         }
 
-    Since rsgain scanning the entire folder is relied upon, call:
-        rsgain easy <folder_path>
-    not rsgain easy <individual files>.
+    Note: In user mode, lib_db_path must be provided.
     """
     if not cleaned_files_map:
         return
 
-    # All files are presumably in the same folder, so find that common folder
-    # Assume cleaned_files_map keys share the same parent path.
-    # If that's not guaranteed, you'd need to handle multiple subfolders differently.
+    # All files are presumably in the same folder; assume cleaned_files_map keys share the same parent.
     file_list = list(cleaned_files_map.keys())
     any_file_path = file_list[0]
     folder_path = os.path.dirname(any_file_path)
@@ -2938,10 +3005,6 @@ def run_replaygain_on_folder(cleaned_files_map, DB_PATH):
     ]
     file_count = len(existing_tracks)
 
-    # Run ReplayGain on the folder
-    # logger.info(f"[DEBUG] All detected tracks in folder before ReplayGain calculation:")
-    # for track in existing_tracks:
-    #     logger.info(f"   {track}")
     logger.info(f"Calculating album ReplayGain via 'rsgain easy \"{folder_path}\"' for folder with {file_count} tracks...\n")
 
     cmd = ["rsgain", "easy", folder_path]
@@ -2959,19 +3022,18 @@ def run_replaygain_on_folder(cleaned_files_map, DB_PATH):
         album_gain = None
         album_peak = None
 
-        # Store track gain/peak in a dict:
+        # Dictionary to store track gain/peak:
         # track_rg_map[filepath] = [gain_str, peak_str]
         track_rg_map = {}
         current_file = None
 
-        # Parse them with simple state-based logic or regex:
+        # Parse output lines with simple state-based logic / regex:
         for line in output.splitlines():
             line_str = line.strip()
             line_lower = line_str.lower()
 
             # Detect "Track: /path/to/file.m4a"
             if line_lower.startswith("track:"):
-                # e.g. "Track: /Users/..."
                 track_path = line_str[6:].strip()
                 track_path_norm = os.path.normpath(track_path)
                 track_rg_map[track_path_norm] = [None, None]  # placeholders
@@ -2985,9 +3047,8 @@ def run_replaygain_on_folder(cleaned_files_map, DB_PATH):
                 logger.debug("Entering album section")
                 continue
 
-            # If in a track section
+            # Within a track section
             if current_file and current_file != "ALBUM":
-                # e.g. "Peak: 1.000000 (0.00 dB)" or "Gain: -9.28 dB"
                 if line_lower.startswith("peak:"):
                     mg = re.search(r"peak:\s*([\d.]+)", line_str, re.IGNORECASE)
                     if mg:
@@ -3001,9 +3062,8 @@ def run_replaygain_on_folder(cleaned_files_map, DB_PATH):
                         track_rg_map[current_file][0] = track_gain
                         logger.debug(f"Track {current_file} gain: {track_gain}")
 
-            # If in the album section
+            # In the album section
             elif current_file == "ALBUM":
-                # e.g. "Peak: 1.000000 (0.00 dB)" or "Gain: -9.28 dB"
                 if line_lower.startswith("peak:"):
                     mg = re.search(r"peak:\s*([\d.]+)", line_str, re.IGNORECASE)
                     if mg:
@@ -3015,17 +3075,17 @@ def run_replaygain_on_folder(cleaned_files_map, DB_PATH):
                         album_gain = mg.group(1) + " dB"
                         logger.debug(f"Album gain: {album_gain}")
 
-        # Now apply these ReplayGain values to the in-memory tags
+        # Apply ReplayGain values to the in-memory tags
         for path_key, tags in cleaned_files_map.items():
             norm_path = os.path.normpath(path_key)
-            # track-level
+            # Track-level
             if norm_path in track_rg_map:
                 track_gain_val, track_peak_val = track_rg_map[norm_path]
                 if track_gain_val:
                     tags["----:com.apple.iTunes:replaygain_track_gain"] = track_gain_val
                 if track_peak_val:
                     tags["----:com.apple.iTunes:replaygain_track_peak"] = track_peak_val
-            # album-level
+            # Album-level
             if album_gain:
                 tags["----:com.apple.iTunes:replaygain_album_gain"] = album_gain
             if album_peak:
@@ -3033,42 +3093,56 @@ def run_replaygain_on_folder(cleaned_files_map, DB_PATH):
             logger.debug(f"Updated cleaned_files_map for {norm_path}: {tags}")
 
         # Now update the database for every track in the folder.
-        # For each file, read the updated embedded tags (if not already in cleaned_files_map)
-        # to obtain the spawn_id, then update the corresponding DB entry.
         for file_path in existing_tracks:
             norm_path = os.path.normpath(file_path)
             base_name = os.path.basename(norm_path)
             if base_name.startswith("temp_"):
-                #logger.info(f"Skipping database update for temporary file {norm_path}.")
                 continue
 
             logger.info(f"Processing file for database update: {norm_path}")
 
-            # Use tags from cleaned_files_map if available; otherwise, read from the file
+            # Use tags from cleaned_files_map if available; otherwise, read embedded tags from the file.
             if norm_path in cleaned_files_map:
                 tags = cleaned_files_map[norm_path]
                 logger.debug(f"Using tags from cleaned_files_map for {norm_path}: {tags}")
             else:
                 tags = get_embedded_tags(norm_path)
                 logger.debug(f"Read tags from file for {norm_path}: {tags}")
-            # Ensure the album ReplayGain values are set in tags.
+
+            # Ensure album ReplayGain values are set in tags.
             if album_gain:
                 tags["----:com.apple.iTunes:replaygain_album_gain"] = album_gain
             if album_peak:
                 tags["----:com.apple.iTunes:replaygain_album_peak"] = album_peak
 
-            # Extract the spawn ID from the embedded tags.
+            # Extract the spawn ID from embedded tags.
             spawn_id = tags.get("----:com.apple.iTunes:spawn_ID")
             if spawn_id and isinstance(spawn_id, bytes):
                 spawn_id = spawn_id.decode('utf-8')
             logger.info(f"For file {norm_path}, found spawn_ID: {spawn_id}")
 
             if spawn_id:
-                # Update only the album ReplayGain keys for the matching DB record.
-                new_rev = update_album_rg_for_spawn_id(DB_PATH, spawn_id, album_gain, album_peak)
-
-                # If the DB update bumped metadata_rev, update the embedded tag as well.
-                if new_rev:
+                if mode == "admin":
+                    # In admin mode, update the catalog database.
+                    new_rev = update_album_rg_for_spawn_id(DB_PATH, spawn_id, album_gain, album_peak)
+                    if new_rev:
+                        update_embedded_metadata_rev(norm_path, new_rev)
+                else:
+                    # In user mode, we do NOT update spawn_catalog.db.
+                    # Instead, update the user library DB.
+                    # Bump the metadata revision using the current value from embedded tags.
+                    old_rev = tags.get("----:com.apple.iTunes:metadata_rev", ["AAA"])[0]
+                    new_rev = bump_metadata_rev(old_rev)
+                    # Update both embedded and JSON metadata_rev.
+                    tags["----:com.apple.iTunes:metadata_rev"] = [new_rev]
+                    tags["metadata_rev"] = [new_rev]
+                    # Determine target table: 'cat_tracks' if a catalog match, otherwise 'lib_tracks'.
+                    table = "cat_tracks" if is_catalog_match(spawn_id) else "lib_tracks"
+                    if lib_db_path is None:
+                        logger.warning(f"User mode selected but no lib_db_path provided; skipping DB update for spawn_id {spawn_id}.")
+                    else:
+                        store_tags_in_user_db(spawn_id, tags, table=table, lib_db_path=lib_db_path)
+                    # Optionally, update the embedded file with the bumped metadata_rev.
                     update_embedded_metadata_rev(norm_path, new_rev)
             else:
                 logger.info(f"Skipping DB update for {norm_path} as no spawn_ID found in embedded tags.")
@@ -4420,6 +4494,7 @@ def process_album_folder(folder, files_in_folder, keep_matched, lastfm_api_key, 
                 temp_tags["----:com.apple.iTunes:metadata_rev"] = "AAA"
                 if is_admin:
                     store_tags_in_db(DB_PATH, spawn_id_val, temp_tags, metadata_rev="AAA")
+                    new_admin_spawn_ids.add(spawn_id_val)
                 else:
                     logger.info("[user] No match in catalog DB; deferring insertion.")
         else:
@@ -4479,6 +4554,7 @@ def process_album_folder(folder, files_in_folder, keep_matched, lastfm_api_key, 
                     musicbrainz_genres=mb_genres,
                     temp_tags=temp_tags
                 )
+                normalize_spawnre(temp_tags)
         else:
             # User Mode: Retrieve spawn_id and local_id as usual
             spawn_id_val = temp_tags.get("----:com.apple.iTunes:spawn_ID")
@@ -4612,7 +4688,11 @@ def process_album_folder(folder, files_in_folder, keep_matched, lastfm_api_key, 
 
     # --- Album-level post-processing: ReplayGain & album art ---
     if cleaned_files_map:
-        run_replaygain_on_folder(cleaned_files_map, DB_PATH)
+        if is_admin:
+            run_replaygain_on_folder(cleaned_files_map, DB_PATH, mode="admin")
+        else:
+            run_replaygain_on_folder(cleaned_files_map, DB_PATH, mode="user", lib_db_path=USER_DB_PATH)
+
         # Use one track's tags as representative for album art lookup
         temp_tags = list(cleaned_files_map.values())[-1]
         def _tag_to_str(val):
@@ -4719,10 +4799,16 @@ def process_audio_files_in_batches(input_dir, batch_threshold=10, keep_matched=F
 # Post-Process Imported Tracks for a Batch
 ###############################################################################
 def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_api_key, sp):
+
+    global EMBED_PATH, USER_EMBED_PATH
+
     # Aggregate tracks from the current mini-batch
     all_tracks = []
+
     for album_data in all_album_data:
         all_tracks.extend(album_data.get("all_tracks", []))
+    # Normalize all_tracks to 3-tuple form: (track_path, track_tags, id_str)
+    all_tracks = [(i[0], i[1], i[2] if len(i) > 2 else None) for i in all_tracks]
     if not all_tracks:
         logger.info("No tracks processed in this mini-batch for final post-processing.")
         return
@@ -4804,36 +4890,33 @@ def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_
             # Check if this spawn_id is already in the catalog DB.
             db_tags = fetch_tags_from_db(spawn_id_str)
             if db_tags is not None:
-                # It’s a duplicate from the catalog.
-                if not keep_matched:
-                    store_tags_in_user_db(
-                        spawn_id=spawn_id_str,
-                        #tag_dict=final_temp_tags,
-                        tag_dict=db_tags,   # Update cat_tracks in library database to exactly match the catalog database entry
-                        #metadata_rev=final_temp_tags.get("----:com.apple.iTunes:metadata_rev", "AAA"),
-                        metadata_rev=db_tags.get("----:com.apple.iTunes:metadata_rev", "AAA"),
-                        table="cat_tracks",
-                        lib_db_path=USER_DB_PATH
-                    )
-                    logger.info(f"Stored catalog metadata in cat_tracks for spawn_id: {spawn_id_str} before deletion.")
-                    logger.info(f"Track {track_path} has spawn_id '{spawn_id_str}' and a catalog match, but KEEP_MATCHED is False. Removing file.")
-                    relative_path = os.path.relpath(track_path, start=OUTPUT_PARENT_DIR)
-                    base_no_ext, _ = os.path.splitext(relative_path)
-                    licn_root = os.path.join(os.path.dirname(OUTPUT_PARENT_DIR), "aux", "user", "licn")
-                    new_txt_path = os.path.join(licn_root, base_no_ext + ".txt")
-                    os.makedirs(os.path.dirname(new_txt_path), exist_ok=True)
-                    try:
-                        with open(new_txt_path, "w", encoding="utf-8") as f:
-                            f.write("")
-                        logger.info(f"Blank txt file created => {new_txt_path}")
-                        os.remove(track_path)
-                        logger.info(f"Removed file: {track_path}")
-                    except Exception as e:
-                        logger.warning(f"Error handling file {track_path}: {e}")
-                    all_tracks[idx] = (new_txt_path, None, spawn_id_str)
-                    continue
-                else:
+                # For admin mode: if this spawn_id was just inserted, do not treat it as a duplicate.
+                if is_admin and spawn_id_str in new_admin_spawn_ids:
                     newly_imported_tracks.append((spawn_id_str, final_temp_tags, track_path))
+                else:
+                    if not keep_matched:
+                        if is_admin:
+                            logger.info(f"[ADMIN] Duplicate found for spawn_id '{spawn_id_str}'. Not importing duplicate track: {track_path}.")
+                        else:
+                            store_tags_in_user_db( ... )
+                        # Remove duplicate file
+                        relative_path = os.path.relpath(track_path, start=OUTPUT_PARENT_DIR)
+                        base_no_ext, _ = os.path.splitext(relative_path)
+                        licn_root = os.path.join(os.path.dirname(OUTPUT_PARENT_DIR), "aux", "user", "licn")
+                        new_txt_path = os.path.join(licn_root, base_no_ext + ".txt")
+                        os.makedirs(os.path.dirname(new_txt_path), exist_ok=True)
+                        try:
+                            with open(new_txt_path, "w", encoding="utf-8") as f:
+                                f.write("")
+                            logger.info(f"Blank txt file created => {new_txt_path}")
+                            os.remove(track_path)
+                            logger.info(f"Removed file: {track_path}")
+                        except Exception as e:
+                            logger.warning(f"Error handling file {track_path}: {e}")
+                        all_tracks[idx] = (new_txt_path, None, spawn_id_str)
+                        continue
+                    else:
+                        newly_imported_tracks.append((spawn_id_str, final_temp_tags, track_path))
             else:
                 # No existing DB entry; treat as a new track.
                 newly_imported_tracks.append((spawn_id_str, final_temp_tags, track_path))
@@ -4952,7 +5035,7 @@ def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_
 
     # Embeddings Generation
     if is_admin:
-        for (track_path, track_tags) in all_tracks:
+        for (track_path, track_tags, id_str) in all_tracks:
             if track_tags is None:
                 continue
             spawn_id_data = track_tags.get("----:com.apple.iTunes:spawn_ID")
@@ -4985,11 +5068,9 @@ def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_
                     local_user_embeddings[local_id_str] = spawn_id_to_embeds.pop(local_id_str)
             else:
                 logger.info(f"[MP4ToVec] No local_id for track: {track_path}; skipping embedding.")
-        lib_path = os.path.dirname(os.path.dirname(OUTPUT_PARENT_DIR))
-        user_embed_path = os.path.join(lib_path, "Spawn", "aux", "user", "mp4tovec_local.p")
         if local_user_embeddings:
             logger.info(f"[MP4ToVec] Saving {len(local_user_embeddings)} local embeddings.")
-            save_combined_embeddings(user_embed_path, local_user_embeddings)
+            save_combined_embeddings(USER_EMBED_PATH, local_user_embeddings)
             local_user_embeddings.clear()
     lib_base = os.path.dirname(os.path.dirname(OUTPUT_PARENT_DIR))
     logger.info("Creating symlinks for imported tracks...")
@@ -5034,9 +5115,13 @@ def run_import(output_path, music_path, skip_prompts=False, keep_matched=False,
         caffeinate_process = None
 
     try:
-        global SKIP_PROMPTS, KEEP_MATCHED, OUTPUT_PARENT_DIR, LOG_DIR, LOG_FILE, DB_PATH, USER_DB_PATH, PLAYLISTS_DIR
+        global SKIP_PROMPTS, KEEP_MATCHED, OUTPUT_PARENT_DIR, LOG_DIR, LOG_FILE, DB_PATH, USER_DB_PATH, PLAYLISTS_DIR, EMBED_PATH, USER_EMBED_PATH
         global ACOUSTID_API_KEY, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, DEFAULT_LASTFM_API_KEY
         global DEBUG_MODE, MP4TOVEC_MODEL, spawn_id_to_embeds, local_user_embeddings
+
+        global new_admin_spawn_ids
+        new_admin_spawn_ids = set()
+
 
         SKIP_PROMPTS = skip_prompts
         KEEP_MATCHED = keep_matched
@@ -5049,6 +5134,7 @@ def run_import(output_path, music_path, skip_prompts=False, keep_matched=False,
         GLOB_DIR = os.path.join(expanded_out, "Spawn", "aux", "glob")
         USER_DIR = os.path.join(expanded_out, "Spawn", "aux", "user")
         EMBED_PATH = os.path.join(GLOB_DIR, "mp4tovec.p")
+        USER_EMBED_PATH = os.path.join(USER_DIR, "mp4tovec_local.p")
 
         os.makedirs(LOG_DIR, exist_ok=True)
         os.makedirs(PLAYLISTS_DIR, exist_ok=True)
