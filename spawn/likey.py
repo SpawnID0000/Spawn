@@ -8,19 +8,6 @@ are assigned a rating of 1, while all other tracks get a continuous like_likelih
 score between -1 and 1 based on their proximity in the embedding space to the 
 explicitly rated tracks.
 
-It also provides an integration function, generate_recommended_playlist(),
-which, when triggered, will compute like_likelihood scores for all tracks and then
-select those with a score below 1 (i.e. not favorites) but above a given threshold 
-(e.g., 0.85). These recommended tracks are then grouped and passed to the curator 
-to generate a curated M3U file (with filename appended with "_recs").
-
-Note: This integration is triggered (for now) only after the user selects advanced
-curation with a favorites filter. In run_curator_advanced() (in curator.py), after 
-favorites filtering, add a prompt such as:
-
-    "Would you also like to generate a curated playlist of other tracks you might like? ([y]/n): "
-
-If the user answers "y", then call generate_recommended_playlist() below.
 """
 
 import os
@@ -117,83 +104,3 @@ def compute_like_likelihoods(embeddings: dict, explicit_ratings: dict, sigma: fl
                 score = 1.0 - weighted_distance
                 results[sid] = score
     return results
-
-# -------------------------
-# Integration: Generate Recommended Playlist
-# -------------------------
-
-def generate_recommended_playlist(spawn_root: str, embeddings: dict, threshold: float = 0.85):
-    """
-    Generate a curated playlist of recommended tracks (those not explicitly marked as favorites)
-    based on their like_likelihood scores. Tracks with a like_likelihood less than 1 (i.e. not favorites)
-    but greater than or equal to 'threshold' (e.g., 0.85) are selected.
-    
-    The selected tracks are grouped by genre and then ordered within each genre cluster using
-    chain-based curation. The final output is written as a curated M3U file with '_recs' appended.
-    
-    Parameters:
-      spawn_root: Root path to the Spawn project.
-      embeddings: Dictionary of track embeddings (spawn_id -> numpy.ndarray).
-      threshold: Float threshold for like_likelihood to include a track (default 0.85).
-    """
-    # Import required functions using relative imports.
-    from .curator import load_tracks_from_db, group_tracks_by_genre, write_curated_m3u, filter_tracks_by_favorites, safe_extract_first, chain_based_curation
-
-    # 1. Load all tracks from the catalog database.
-    db_path = os.path.join(spawn_root, "Spawn", "aux", "glob", "spawn_catalog.db")
-    full_tracks = load_tracks_from_db(db_path)
-    if not full_tracks:
-        print("[INFO] No tracks found in the database for recommendations.")
-        return
-
-    # 2. Build explicit ratings from the favorites.
-    favorites, _, _ = filter_tracks_by_favorites(full_tracks, spawn_root, "3")
-    explicit_ratings = {}
-    for track in favorites:
-        sid = track.get("spawn_id")
-        if sid:
-            explicit_ratings[sid] = 1  # rating for favorites
-
-    if not explicit_ratings:
-        print("[INFO] No explicit favorite ratings found; cannot generate recommendations.")
-        return
-
-    # 3. Compute like_likelihood scores for all tracks.
-    like_scores = compute_like_likelihoods(embeddings, explicit_ratings, sigma=0.15)
-
-    # 4. Select recommended tracks: those with like_score >= threshold and < 1.
-    recommended_tracks = []
-    for track in full_tracks:
-        sid = track.get("spawn_id")
-        if sid in like_scores:
-            score = like_scores[sid]
-            if score < 1.0 and score >= threshold:
-                recommended_tracks.append(track)
-
-    if not recommended_tracks:
-        print(f"[INFO] No recommended tracks found with like_likelihood >= {threshold}.")
-        return
-
-    # Output debug information for each recommended track.
-    for track in recommended_tracks:
-        sid = track.get("spawn_id", "unknown")
-        title = safe_extract_first(track, "©nam") or "Untitled"
-        score = like_scores.get(sid, 0.0)
-        print(f"[DEBUG] Track {sid} \"{title}\" => like_likelihood={score:.4f}")
-
-    print(f"[INFO] Found {len(recommended_tracks)} recommended tracks with like_likelihood >= {threshold}.")
-
-    # 5. Group recommended tracks by genre.
-    clusters = group_tracks_by_genre(recommended_tracks)
-
-    # 6. Apply chain-based ordering within each genre cluster.
-    for genre, tracks in clusters.items():
-        clusters[genre] = chain_based_curation(tracks, embeddings)
-
-    # 7. Write the recommended curated M3U file with a '_recs' suffix.
-    m3u_path = write_curated_m3u(spawn_root, list(clusters.items()), favorites_filter_desc="recommended", suffix="_recs")
-
-    if m3u_path:
-        print(f"[INFO] Recommended curated playlist created at: {m3u_path}")
-    else:
-        print("[ERROR] Could not write the recommended curated M3U playlist.")

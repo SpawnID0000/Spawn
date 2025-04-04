@@ -16,8 +16,7 @@ import numpy as np
 import torch
 #import tensorflow as tf
 
-from collections import defaultdict
-from collections import Counter
+from collections import defaultdict, Counter
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 #from audiodiffusion.audio_encoder import AudioEncoder
@@ -30,10 +29,27 @@ from .audiodiffusion.audio_encoder import AudioEncoder
 from .MP4ToVec import load_mp4tovec_model_diffusion, generate_embedding
 from sklearn.metrics.pairwise import cosine_similarity
 from .likey import compute_like_likelihoods
+from .track_loader import load_and_merge
 
 from .dic_spawnre import genre_mapping, subgenre_to_parent, genre_synonyms
 
 logger = logging.getLogger(__name__)
+
+
+###############################################################################
+# HELPER: Build embeddings dictionary from merged track data.
+###############################################################################
+def build_embeddings_dict(tracks: List[dict]) -> Dict[str, np.ndarray]:
+    """
+    Builds a dictionary mapping an identifier (spawn_id if available, else local_ID)
+    to its embedding (if present) for all tracks.
+    """
+    emb = {}
+    for t in tracks:
+        key = t.get("spawn_id") or t.get("local_id")
+        if key and t.get("embedding") is not None:
+            emb[key] = t["embedding"]
+    return emb
 
 
 ###############################################################################
@@ -335,8 +351,9 @@ def assign_albums_to_clusters(excluded_album_m3us: List[str],
 
 def run_curator(spawn_root: str, is_admin: bool = True):
     """
-    A single entry point that can do either BASIC or ADVANCED curation,
-    depending on the user's input.
+    Entry point for curation that loads tracks using track_loader,
+    builds an embeddings dictionary from the merged tracks, and then proceeds
+    with filtering, clustering, and ordering.
 
     Steps performed:
       1) Determine DB & load tracks
@@ -357,31 +374,64 @@ def run_curator(spawn_root: str, is_admin: bool = True):
     do_advanced = (choice != "n")  # "y" or Enter => True, "n" => False
 
     # ------------------------------------------------------------------------
-    # 1) Determine DB path & table name based on admin mode
+    # 1) Load tracks (catalog tracks only for admin mode; catalog & local tracks for user mode)
     # ------------------------------------------------------------------------
-    if is_admin:
-        db_path = os.path.join(spawn_root, "Spawn", "aux", "glob", "spawn_catalog.db")
-        table_name = "tracks"
-    else:
-        db_path = os.path.join(spawn_root, "Spawn", "aux", "user", "spawn_library.db")
-        table_name = "cat_tracks"
-
-    if not os.path.isfile(db_path):
-        print(f"[ERROR] Database not found at: {db_path}")
-        return
-
-    # ------------------------------------------------------------------------
-    # 2) Load tracks
-    # ------------------------------------------------------------------------
-    all_tracks_full = load_tracks_from_db(db_path, table_name=table_name)
+    user_mode = not is_admin
+    tracks_df = load_and_merge(user_mode=user_mode, spawn_root=spawn_root)
+    all_tracks_full = tracks_df.to_dict(orient="records")
     all_tracks = list(all_tracks_full)
     
     if not all_tracks:
-        print("[INFO] No tracks found in the database. Nothing to curate.")
+        print("[INFO] No tracks found. Nothing to curate.")
         return
 
-    # Filter to valid audio files
-    filter_existing_files = True  # Set to False to disable filtering by file existence (i.e. to test curation of all catalog tracks)
+    # ------------------------------------------------------------------------
+    # 2) Optionally filter by ownership
+    # ------------------------------------------------------------------------
+    own_filter = None
+    own_input = input(
+        "\nIf you'd like to filter by file ownership, enter one of the following options:\n"
+        "   cat = (catalog) global catalog only, not in library\n"
+        "   lib = (library) all library tracks\n"
+        "   mat = (matched) library tracks matched to catalog\n"
+        "   nom = (not matched) library tracks not matched to catalog\n"
+        "   noo = (not owned) global catalog tracks not in library\n"
+        "\nOtherwise, to include all tracks in catalog & library, just press Enter: "
+    ).strip()
+    if own_input.lower() in ["cat", "lib", "mat", "nom", "noo"]:
+        own_filter = own_input.lower()
+    elif own_input != "":
+        print("[WARN] Invalid value provided; no ownership filtering will be applied.")
+
+    if own_filter:
+        before_origin_filter = len(all_tracks)
+        if own_filter == "lib":
+            # Library tracks include both matched ("mat") and non-matched ("nom")
+            all_tracks = [t for t in all_tracks if t.get("origin") in ["mat", "nom"]]
+        elif own_filter in ["cat", "mat", "nom"]:
+            all_tracks = [t for t in all_tracks if t.get("origin") == own_filter]
+        elif own_filter == "noo":
+            # Admin mode only: from the global catalog (origin=="cat"),
+            # exclude those that appear in the user library's cat_tracks.
+            if is_admin:
+                lib_db_path = os.path.join(spawn_root, "Spawn", "aux", "user", "spawn_library.db")
+                try:
+                    with sqlite3.connect(lib_db_path) as conn:
+                        df_cat = pd.read_sql_query("SELECT spawn_id FROM cat_tracks", conn)
+                    cat_ids = set(df_cat["spawn_id"].astype(str).str.strip())
+                    all_tracks = [t for t in all_tracks if t.get("spawn_id", "").strip() not in cat_ids]
+                except Exception as e:
+                    print(f"[WARN] Could not apply @own:noo filter: {e}")
+            else:
+                # In user mode, fallback to filtering as if @own:cat was specified.
+                all_tracks = [t for t in all_tracks if t.get("origin") == "cat"]
+        print(f"[INFO] Applied @own filter '{own_filter}': {before_origin_filter} -> {len(all_tracks)} tracks")
+
+    # ------------------------------------------------------------------------
+    # 3) Filter to valid audio files
+    # ------------------------------------------------------------------------
+    filter_existing_files = True
+
     if filter_existing_files:
         original_count = len(all_tracks)
         valid_tracks = []
@@ -406,12 +456,12 @@ def run_curator(spawn_root: str, is_admin: bool = True):
     # In user mode, keep only tracks that have a Spawn ID
     if not is_admin:
         before_user_filter = len(all_tracks)
-        all_tracks = [t for t in all_tracks if t.get("spawn_id")]
+        all_tracks = [t for t in all_tracks if (t.get("spawn_id") or t.get("local_id"))]
         if before_user_filter != len(all_tracks):
-            print(f"[INFO] Retained {len(all_tracks)} user tracks that have a Spawn ID.")
+            print(f"[INFO] Retained {len(all_tracks)} user tracks with a valid ID (catalog or local).")
 
     # ------------------------------------------------------------------------
-    # Optionally filter by favorites, recommendations, or none
+    # 4) Optionally filter by favorites, recommendations, or none
     # ------------------------------------------------------------------------
     favorites_filter_desc = None
     suffix = ""
@@ -479,22 +529,8 @@ def run_curator(spawn_root: str, is_admin: bool = True):
 
             # Special branch: if only favorite albums were selected, build album blocks from the full library.
             if fav_options == {"2"}:
-                # Load embeddings (if not already loaded)
-                embeddings_path = os.path.join(spawn_root, "Spawn", "aux", "glob", "mp4tovec.p")
-                if not os.path.isfile(embeddings_path):
-                    print(f"[ERROR] Embeddings file not found at: {embeddings_path}.")
-                    return
-                try:
-                    with open(embeddings_path, "rb") as f:
-                        embeddings = pickle.load(f)
-                    if not isinstance(embeddings, dict):
-                        raise ValueError("Embeddings file does not contain a dictionary.")
-                except Exception as e:
-                    print(f"[ERROR] Failed to load embeddings: {e}")
-                    return
 
-                # Initialize last_track_embedding as None
-                last_track_embedding = None
+                embeddings_temp = build_embeddings_dict(all_tracks_full)
 
                 # Build album comments (this uses the full list of album paths).
                 album_comments = build_album_comments(excluded_album_m3us, all_tracks_full, spawn_root)
@@ -537,7 +573,8 @@ def run_curator(spawn_root: str, is_admin: bool = True):
                         album_blocks.append(album_block)
 
                 # Chain-based ordering on album blocks (so adjacent albums have similar embeddings)
-                chain_ordered = chain_based_curation(album_blocks, embeddings, last_track_embedding)
+                chain_ordered = chain_based_curation(album_blocks, embeddings_temp, None)
+                #chain_ordered = chain_based_curation(album_blocks, embeddings, last_track_embedding)
                 curated_clusters = [("favorite albums", chain_ordered)]
 
                 final_m3u_path = write_curated_m3u(
@@ -594,75 +631,65 @@ def run_curator(spawn_root: str, is_admin: bool = True):
             if spid:
                 explicit_ratings[spid.strip()] = 1
 
-        # Attempt to load embeddings.
-        embeddings_path = os.path.join(spawn_root, "Spawn", "aux", "glob", "mp4tovec.p")
-        if not os.path.isfile(embeddings_path):
-            print(f"[ERROR] Embeddings file not found at: {embeddings_path}. Cannot apply recommendation filtering.")
-            favorites_filter_desc = None
-            suffix = ""
-        else:
-            try:
-                with open(embeddings_path, "rb") as f:
-                    embeddings = pickle.load(f)
-                if not isinstance(embeddings, dict):
-                    raise ValueError("Embeddings file does not contain a dictionary.")
-            except Exception as e:
-                print(f"[ERROR] Failed to load embeddings: {e}")
-                favorites_filter_desc = None
-                suffix = ""
+        # Load embeddings
+        embeddings_temp = build_embeddings_dict(all_tracks_full)
+        threshold = 0.98
+        #threshold = 0.982
+
+        # Use compute_like_likelihoods to get scores
+        like_scores = compute_like_likelihoods(embeddings_temp, explicit_ratings, sigma=0.15)
+
+        recommended_tracks = []
+        for track in all_tracks_for_recs:
+            sid = (track.get("spawn_id") or track.get("local_id") or "").strip()
+            if sid in explicit_ratings:
+                continue
+
+            if sid in like_scores:
+                score = like_scores[sid]
+
+                # DEBUG: Print the like_likelihood score for each candidate
+                title = safe_extract_first(track, "©nam", normalize=False) or "Untitled"
+                artist = safe_extract_first(track, "©ART", normalize=False) or "Unknown Artist"
+                #print(f"[DEBUG] {artist} - {title} [{sid}] => like_likelihood = {score:.4f}")
+                
+                if score < 1.0 and score >= threshold:
+                    recommended_tracks.append(track)
+        all_tracks = recommended_tracks
+        favorites_filter_desc = f"recommended (like_likelihood >= {threshold:.3f})"
+        suffix = "_recs"
+
+        #print(f"[DEBUG] Total recommended tracks (before extra filtering): {len(all_tracks)}")
+        extra_filter = input(
+            "\nIf you'd like to restrict recommendations to specific genres and/or artists,\n"
+            "enter '@gen' or '@art' followed by a comma-separated list of values.\n"
+            "Otherwise, just press Enter to continue: "
+        ).strip()
+        if extra_filter:
+            extra_filter_str = extra_filter
+            extra_filter_lower = extra_filter.lower()
+            filtered_tracks = []
+            if extra_filter_lower.startswith("@gen"):
+                genres_str = extra_filter[4:].strip()
+                genres_list = [g.strip().lower() for g in genres_str.split(",") if g.strip()]
+                for track in all_tracks:
+                    gen_tag = safe_extract_first(track, "©gen", normalize=True) or ""
+                    spawnre_tag = safe_extract_first(track, "----:com.apple.iTunes:spawnre", normalize=True) or ""
+                    combined_genres = (gen_tag + " " + spawnre_tag).lower()
+                    if combined_genres and any(g in combined_genres for g in genres_list):
+                        filtered_tracks.append(track)
+                all_tracks = filtered_tracks
+            elif extra_filter_lower.startswith("@art"):
+                artists_str = extra_filter[4:].strip()
+                artists_list = [a.strip().lower() for a in artists_str.split(",") if a.strip()]
+                for track in all_tracks:
+                    artist = safe_extract_first(track, "©ART", normalize=True) or ""
+                    if artist.lower() and any(a in artist.lower() for a in artists_list):
+                        filtered_tracks.append(track)
+                all_tracks = filtered_tracks
             else:
-                # Compute like-likelihood scores for all tracks using the full track set.
-                like_scores = compute_like_likelihoods(embeddings, explicit_ratings, sigma=0.15)
-                threshold = 0.98
-                recommended_tracks = []
-                for track in all_tracks_for_recs:
-                    # Use spawn_id as-is
-                    sid = track.get("spawn_id", "").strip()
-                    if sid in like_scores:
-                        score = like_scores[sid]
-                        # Exclude explicit favorites (score == 1) and select tracks above threshold.
-                        if score < 1.0 and score >= threshold:
-                            recommended_tracks.append(track)
-                all_tracks = recommended_tracks  # Replace the current set with recommended tracks.
-                favorites_filter_desc = f"recommended (like_likelihood >= {threshold:.2f})"
-                suffix = "_recs"
-
-                # Optional additional filtering by genre and/or artist
-                extra_filter = input(
-                    "\nIf you'd like to restrict recommendations to specific genres and/or artists,\n"
-                    "enter '@gen' or '@art' followed by a comma-separated list of values.\n"
-                    "Otherwise, just press Enter to continue: "
-                ).strip()
-                if extra_filter:
-                    extra_filter_str = extra_filter # Save the filter text for inclusion in the M3U comment
-                    extra_filter_lower = extra_filter.lower()
-                    filtered_tracks = []
-                    if extra_filter_lower.startswith("@gen"):
-                        # Extract genres (do not change case here, but we compare in lower-case)
-                        genres_str = extra_filter[4:].strip()
-                        genres_list = [g.strip().lower() for g in genres_str.split(",") if g.strip()]
-                        for track in all_tracks:
-                            # Check both the "©gen" tag and the "spawnre" tag.
-                            gen_tag = safe_extract_first(track, "©gen", normalize=True) or ""
-                            spawnre_tag = safe_extract_first(track, "----:com.apple.iTunes:spawnre", normalize=True) or ""
-                            combined_genres = (gen_tag + " " + spawnre_tag).lower()
-                            if combined_genres and any(g in combined_genres for g in genres_list):
-                                filtered_tracks.append(track)
-                        all_tracks = filtered_tracks
-                    elif extra_filter_lower.startswith("@art"):
-                        # Extract artist filter values.
-                        artists_str = extra_filter[4:].strip()
-                        artists_list = [a.strip().lower() for a in artists_str.split(",") if a.strip()]
-                        for track in all_tracks:
-                            artist = safe_extract_first(track, "©ART", normalize=True) or ""
-                            if artist.lower() and any(a in artist.lower() for a in artists_list):
-                                filtered_tracks.append(track)
-                        all_tracks = filtered_tracks
-                    else:
-                        print("[WARN] Unrecognized extra filter format; skipping extra filtering.")
-
-                    # Update the M3U filter description to include extra filter info.
-                    favorites_filter_desc += f" | Extra filter: {extra_filter_str}"
+                print("[WARN] Unrecognized extra filter format; skipping extra filtering.")
+            favorites_filter_desc += f" | Extra filter: {extra_filter_str}"
 
     elif filter_choice == "3" or not filter_choice:
         # --- No filtering branch ---
@@ -674,170 +701,79 @@ def run_curator(spawn_root: str, is_admin: bool = True):
         suffix = ""
 
     # ------------------------------------------------------------------------
-    # 4) Group into clusters by spawnre/©gen
+    # 5) Group into clusters by spawnre/©gen
     # ------------------------------------------------------------------------
     base_clusters = group_tracks_by_genre(all_tracks)
+    #print(f"[DEBUG] Final track count passed to M3U writer: {len(all_tracks)}")
+    #print(f"\n[DEBUG] Initial genre cluster breakdown (before merging):")
+    for genre_key, cluster_tracks in base_clusters.items():
+        print(f"  - Cluster '{genre_key}': {len(cluster_tracks)} tracks")
 
     # ------------------------------------------------------------------------
-    # 5) Optional merge of similar clusters via embeddings
+    # 6) Optional merge of similar clusters via embeddings
     # ------------------------------------------------------------------------
-
-    def compute_cluster_breadth(embeddings_list: List[np.ndarray], centroid: np.ndarray) -> float:
-        """
-        Given a list of embedding vectors and a centroid, return the average Euclidean
-        distance of the embeddings from the centroid.
-        """
-        if not embeddings_list:
-            return 0.0
-        distances = [np.linalg.norm(emb - centroid) for emb in embeddings_list]
-        return sum(distances) / len(distances)
-
-    def merge_similar_clusters_with_breadth(clusters: Dict[str, List[dict]], embeddings: Dict[str, np.ndarray],
-                                            centroid_threshold: float = 0.97, breadth_tolerance: float = 0.5) -> Dict[str, List[dict]]:
-        """
-        Merge clusters only if:
-          1) The cosine similarity of their centroids is above centroid_threshold.
-          2) Their breadths (average distances of embeddings to the centroid) are similar—
-             defined by the relative difference between breadths being less than or equal to breadth_tolerance.
-          3) Also checks for overlapping genres between clusters.
-
-        Parameters:
-          - clusters: Dictionary mapping cluster id to a list of track dicts.
-          - embeddings: Dictionary mapping spawn_id to an embedding vector.
-          - centroid_threshold: Minimum cosine similarity required to consider merging.
-          - breadth_tolerance: Maximum allowed relative difference between the breadths.
-             (For example, a value of 0.5 means the breadths must be within 50% of each other.)
-        
-        Returns:
-          A new dictionary with merged clusters.
-        """
-
-        # Compute centroids and breadth for each cluster.
-        cluster_stats = {}  # key -> (centroid, breadth, genre_tokens)
-        
-        def extract_genre_tokens(track_list):
-            """ Extracts all spawnre and spawnre_hex values from a cluster's tracks into a set of genre tokens. """
-            genre_tokens = set()
-            for track in track_list:
-                # Extract spawnre and split into individual genres
-                if "spawnre" in track and track["spawnre"]:
-                    genre_tokens.update(track["spawnre"].split(","))  
-
-                # Decode spawnre_hex and ensure it's properly split
-                if "spawnre_hex" in track and track["spawnre_hex"]:
-                    hex_decoded = decode_spawnre_hex(track["spawnre_hex"])  
-                    genre_tokens.update(hex_decoded.split(","))  # Ensure splitting works correctly
-
-            # Fallback to avoid empty genre sets
-            if not genre_tokens:
-                genre_tokens.add("unknown_genre")
-
-            return genre_tokens
-
-        for cid, tracks in clusters.items():
-            emb_list = [embeddings[t.get("spawn_id")] for t in tracks if t.get("spawn_id") in embeddings]
-            if emb_list:
-                arr = np.vstack(emb_list)
-                centroid = arr.mean(axis=0)
-                breadth = compute_cluster_breadth(emb_list, centroid)
-                genre_tokens = extract_genre_tokens(tracks)  # Extract genre tokens
-                cluster_stats[cid] = (centroid, breadth, genre_tokens)
-            else:
-                cluster_stats[cid] = (None, None, {"unknown_genre"})  # Ensure no empty sets
-
-        labels = list(cluster_stats.keys())
-        merged_clusters = {}
-        merged = set()
-
-        for i, label_i in enumerate(labels):
-            if label_i in merged:
-                continue
-            current_cluster = clusters[label_i][:]  # Start with a copy of this cluster's tracks
-            centroid_i, breadth_i, genres_i = cluster_stats[label_i]
-
-            for j in range(i + 1, len(labels)):
-                label_j = labels[j]
-                if label_j in merged:
-                    continue
-                centroid_j, breadth_j, genres_j = cluster_stats[label_j]
-                if centroid_i is None or centroid_j is None:
-                    continue
-
-                # Compute cosine similarity between centroids.
-                sim = cosine_similarity(centroid_i.reshape(1, -1), centroid_j.reshape(1, -1))[0][0]
-                if sim > centroid_threshold:
-                    # Check breadth similarity if available.
-                    if breadth_i is not None and breadth_j is not None:
-                        avg_breadth = (breadth_i + breadth_j) / 2
-                        rel_diff = abs(breadth_i - breadth_j) / avg_breadth if avg_breadth > 0 else 0
-                        if rel_diff > breadth_tolerance:
-                            continue  # Skip merge if breadths are too different
-                    
-                    # Check for genre overlap
-                    common_genres = genres_i.intersection(genres_j)
-                    if len(common_genres) >= 1:  # Sets number of required overlapping genres
-                        # Merge clusters
-                        current_cluster.extend(clusters[label_j])
-                        merged.add(label_j)
-            
-            merged_clusters[label_i] = current_cluster
-
-        return merged_clusters
-
     merge_choice = input("\nMerge similar clusters? ([y]/n): ").strip().lower()
-    if merge_choice in ["", "y"]:    # Default "y"
-    #if merge_choice == "y":    # Default "n"
-        embeddings_path = os.path.join(spawn_root, "Spawn", "aux", "glob", "mp4tovec.p")
-        if not os.path.isfile(embeddings_path):
-            print(f"[ERROR] Embeddings file not found at: {embeddings_path}. Skipping merge.")
-        else:
-            try:
-                with open(embeddings_path, "rb") as f:
-                    embeddings = pickle.load(f)
-                if not isinstance(embeddings, dict):
-                    raise ValueError("Embeddings file does not contain a dictionary.")
-            except Exception as e:
-                print(f"[ERROR] Failed to load embeddings: {e}. Skipping merge.")
-            else:
-                # Attach embedding to each track (if available)
-                print("    Merging similar clusters...")
-                for cluster_tracks in base_clusters.values():
-                    for track in cluster_tracks:
-                        sid = track.get("spawn_id")
-                        if sid in embeddings:
-                            track['embedding'] = embeddings[sid]
-                base_clusters = merge_similar_clusters_with_breadth(base_clusters, embeddings,
-                                                                     centroid_threshold=0.97,
-                                                                     breadth_tolerance=0.5)
-                #print("Similar clusters have been merged.")
+
+    # Load both catalog and user embeddings
+    catalog_embed_path = os.path.join(spawn_root, "Spawn", "aux", "glob", "mp4tovec.p")
+    user_embed_path    = os.path.join(spawn_root, "Spawn", "aux", "user", "mp4tovec_local.p")
+
+    catalog_embeds = {}
+    user_embeds = {}
+
+    if os.path.isfile(catalog_embed_path):
+        with open(catalog_embed_path, "rb") as f:
+            catalog_embeds = pickle.load(f)
+
+    if os.path.isfile(user_embed_path):
+        with open(user_embed_path, "rb") as f:
+            user_embeds = pickle.load(f)
+            #print(f"[DEBUG] Sample keys in user_embeds: {list(user_embeds.keys())[:5]}")
+
+    all_embed_dict = {**catalog_embeds, **user_embeds}
+
+    embeddings = all_embed_dict
+    #embeddings = build_embeddings_dict(all_tracks_full)  # Build embeddings dict from merged tracks.
+
+    local_ids = [t.get("local_id") for t in all_tracks_full if t.get("origin") == "nom"]
+    #print(f"[DEBUG] Sample local_ids from all_tracks_full: {local_ids[:5]}")
+    normalized_embed_keys = {k.strip().lower(): v for k, v in all_embed_dict.items()}
+    embeddings = normalized_embed_keys
+    present = [lid for lid in (lid.strip().lower() for lid in local_ids if lid) if lid in embeddings]
+    print(f"[INFO] Local ID embeddings present: {len(present)} of {len(local_ids)}\n")
+
+    if merge_choice in ["", "y"]:
+        print("    Merging similar clusters...")
+        # Since embeddings are already attached, we can pass our dictionary directly.
+        base_clusters = merge_similar_clusters_with_breadth(base_clusters, embeddings,
+                                                             centroid_threshold=0.97,
+                                                             breadth_tolerance=0.5)
+        #print("Similar clusters have been merged.")
 
     # ------------------------------------------------------------------------
-    # 6) (Advanced-Only) Load embeddings & refine cluster membership
+    # 7) (Advanced-Only) Load embeddings & refine cluster membership
     # ------------------------------------------------------------------------
     curated_clusters = []
     last_track_embedding = None
 
     if do_advanced:
-        # 6a) Load embeddings
-        embeddings_path = os.path.join(spawn_root, "Spawn", "aux", "glob", "mp4tovec.p")
-        if not os.path.isfile(embeddings_path):
-            print(f"[ERROR] Embeddings file not found at: {embeddings_path}")
-            return
-        try:
-            with open(embeddings_path, "rb") as f:
-                embeddings = pickle.load(f)
-            if not isinstance(embeddings, dict):
-                raise ValueError("Embeddings file does not contain a dictionary.")
-        except Exception as e:
-            print(f"[ERROR] Failed to load embeddings: {e}")
-            return
 
-        # 6b) Refine membership
+        # DEBUG
+        #print("[DEBUG] Cluster sizes before refinement:")
+        for g, tracks in base_clusters.items():
+            print(f"  - Cluster '{g}': {len(tracks)} tracks")
+
+        # 7a) Refine membership
         refined_clusters = refine_clusters_by_embeddings(
             all_tracks, embeddings, base_clusters, distance_threshold=0.15
         )
 
-        # 6c) Sort clusters, placing "outliers" last
+        # DEBUG
+        #print("[DEBUG] Cluster sizes after refinement:")
+        for g, tracks in refined_clusters.items():
+            print(f"  - Cluster '{g}': {len(tracks)} tracks")
+
+        # 7b) Sort clusters, placing "outliers" last
         all_genre_keys = sorted(g for g in refined_clusters.keys() if g != "outliers")
         if "outliers" in refined_clusters:
             all_genre_keys.append("outliers")
@@ -854,7 +790,7 @@ def run_curator(spawn_root: str, is_admin: bool = True):
             similarity_threshold=0.0  # or choose a threshold if desired
         )
 
-        # 6d) Chain-based ordering with album blocks
+        # 7c) Chain-based ordering with album blocks
         for genre in all_genre_keys:
             # Get the refined tracks for this genre.
             track_list = refined_clusters[genre]
@@ -870,27 +806,30 @@ def run_curator(spawn_root: str, is_admin: bool = True):
             # Combine normal tracks with album blocks.
             combined_candidates = track_list + album_blocks
             # Order candidates with chain-based ordering
+            #print(f"[DEBUG] Refining genre cluster '{genre}': {len(track_list)} tracks + {len(album_blocks)} album blocks")
             chain_ordered = chain_based_curation(combined_candidates, embeddings, last_track_embedding)
+            #print(f"[DEBUG] => Result: {len(chain_ordered)} tracks kept after chain-based ordering")
+
             curated_clusters.append((genre, chain_ordered))
 
             # Update last_track_embedding based on the final track in the chain.
             if chain_ordered:
                 last_track = chain_ordered[-1]
-                sid = last_track.get("spawn_id")
-                last_track_embedding = embeddings.get(sid) if sid in embeddings else None
+                sid = last_track.get("spawn_id") or last_track.get("local_id")
+                last_track_embedding = embeddings.get(sid)
 
     else:
         # BASIC PATH
-        # 6a) Order clusters by relationships
+        # 7a) Order clusters by relationships
         ordered_genres = order_clusters_by_relationships(base_clusters)
         if not ordered_genres:
             print("[ERROR] Could not order clusters by relationship. Exiting.")
             return
 
-        # 6b) Allow user to optionally modify cluster order
+        # 7b) Allow user to optionally modify cluster order
         ordered_genres = maybe_modify_cluster_order(ordered_genres, base_clusters, spawn_root)
 
-        # 6c) Shuffle each cluster
+        # 7c) Shuffle each cluster
         for genre in ordered_genres:
             track_list = base_clusters[genre]
             random.shuffle(track_list)
@@ -903,9 +842,10 @@ def run_curator(spawn_root: str, is_admin: bool = True):
         clusters_for_albums = base_clusters      # basic mode
 
     # ------------------------------------------------------------------------
-    # 7) Write M3U
+    # 8) Write M3U
     # ------------------------------------------------------------------------
 
+    #print(f"[DEBUG] Final track count passed to M3U writer: {len(all_tracks)}")
     final_m3u_path = write_curated_m3u(
         spawn_root,
         curated_clusters,
@@ -924,7 +864,7 @@ def run_curator(spawn_root: str, is_admin: bool = True):
         return
 
     # ------------------------------------------------------------------------
-    # 8) Summaries
+    # 9) Summaries
     # ------------------------------------------------------------------------
     if do_advanced:
         print("\n[Summary of refined clusters]:")
@@ -942,6 +882,10 @@ def run_curator(spawn_root: str, is_admin: bool = True):
 ###############################################################################
 # CHAIN-BASED ORDERING
 ###############################################################################
+
+def get_embedding_key(track_dict):
+    sid = track_dict.get("spawn_id") or track_dict.get("local_id") or ""
+    return sid.strip().lower()
 
 def chain_based_curation(
     candidates: List[dict],
@@ -966,6 +910,8 @@ def chain_based_curation(
     remaining = candidates.copy()
     ordered = []
 
+    #print(f"[DEBUG] Starting chain curation with {len(remaining)} candidates.")
+
     # Initialize current_embedding: if none, choose a random candidate.
     if last_track_embedding is None and remaining:
         chosen_index = random.randrange(len(remaining))
@@ -984,10 +930,10 @@ def chain_based_curation(
             }
             ordered.append(footer)
             album_last = candidate["album_tracks"][-1]
-            last_track_embedding = embeddings.get(album_last.get("spawn_id"))
+            last_track_embedding = embeddings.get(get_embedding_key(album_last))
         else:
             ordered.append(candidate)
-            last_track_embedding = embeddings.get(candidate.get("spawn_id"))
+            last_track_embedding = embeddings.get(get_embedding_key(candidate))
 
     # Process all remaining candidates in one unified loop.
     while remaining and last_track_embedding is not None:
@@ -999,16 +945,20 @@ def chain_based_curation(
             # Determine candidate embedding based on candidate type.
             if candidate.get("is_album"):
                 first_track = candidate["album_tracks"][0]
-                cand_emb = embeddings.get(first_track.get("spawn_id"))
+                cand_emb = embeddings.get(get_embedding_key(first_track))
             else:
-                cand_emb = embeddings.get(candidate.get("spawn_id"))
+                cand_emb = embeddings.get(get_embedding_key(candidate))
             if cand_emb is None:
+                track_name = first_track.get("©nam") if candidate.get("is_album") else candidate.get("©nam")
+                print(f"[DEBUG] Skipping candidate '{name}' — no embedding found (key: {get_embedding_key(first_track or candidate)})")
                 continue
 
             # Compute cosine similarity (or distance)
             dot_val = np.dot(last_track_embedding, cand_emb)
             denom = np.linalg.norm(last_track_embedding) * np.linalg.norm(cand_emb)
             if denom == 0:
+                track_name = first_track.get("©nam") if candidate.get("is_album") else candidate.get("©nam")
+                print(f"[DEBUG] Skipping candidate '{track_name}' — zero norm in embedding")
                 continue
             similarity = dot_val / denom
             distance = 1 - similarity
@@ -1019,6 +969,7 @@ def chain_based_curation(
                 best_index = i
 
         if best_candidate is None:
+            print("[DEBUG] No more valid candidates could be chained; ending curation.")
             break  # No valid candidate found.
         # Remove the chosen candidate from remaining.
         remaining.pop(best_index)
@@ -1038,10 +989,19 @@ def chain_based_curation(
             }
             ordered.append(footer)
             album_last = best_candidate["album_tracks"][-1]
-            last_track_embedding = embeddings.get(album_last.get("spawn_id"))
+            last_track_embedding = embeddings.get(get_embedding_key(album_last))
+
+            album_name = best_candidate["album_comment"]
+            print(f"[DEBUG] Added album block: '{album_name}' with {len(best_candidate['album_tracks'])} tracks")
         else:
             ordered.append(best_candidate)
-            last_track_embedding = embeddings.get(best_candidate.get("spawn_id"))
+            last_track_embedding = embeddings.get(get_embedding_key(best_candidate))
+
+            track_title = best_candidate.get("©nam") or "Untitled"
+            track_artist = best_candidate.get("©ART") or "Unknown Artist"
+            #print(f"[DEBUG] Added track: {track_artist} - {track_title} [{get_embedding_key(best_candidate)}], distance={best_distance:.4f}")
+
+    #print(f"[DEBUG] [chain_based_curation] Finished with {len(ordered)} items in final chain.")
 
     return ordered
 
@@ -1072,10 +1032,12 @@ def refine_clusters_by_embeddings(
     #print(f"[DEBUG] distance_threshold = {distance_threshold:.2f}")
 
     for track_info in all_tracks:
-        sid = track_info.get("spawn_id")
+        sid_raw = track_info.get("spawn_id") or track_info.get("local_id")
+        sid = sid_raw.strip().lower() if sid_raw else None
+
         # If no embedding, it goes to outliers
-        if sid not in embeddings:
-            print(f"[DEBUG] Track {sid} => no embedding => outliers")
+        if not sid or sid not in embeddings:
+            print(f"[DEBUG] Track {sid_raw} => no embedding => outliers")
             refined["outliers"].append(track_info)
             continue
 
@@ -1124,7 +1086,7 @@ def compute_cluster_centroids(
     for genre, track_list in clusters.items():
         emb_list = []
         for t in track_list:
-            sid = t.get("spawn_id")
+            sid = t.get("spawn_id") or t.get("local_id")
             if sid in embeddings:
                 emb_list.append(embeddings[sid])
 
@@ -1138,36 +1100,6 @@ def compute_cluster_centroids(
             #print(f"[DEBUG] genre='{genre}': 0 embeddings => centroid=None")
 
     return centroids
-
-
-###############################################################################
-# Load tracks from database
-###############################################################################
-
-def load_tracks_from_db(db_path: str, table_name: str = "tracks") -> List[dict]:
-    """
-    Reads spawn_id and tag_data (JSON) from the specified table.
-    Returns a list of dicts, each representing a track's tags.
-    """
-    results = []
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        query = f"SELECT spawn_id, tag_data FROM {table_name}"
-        cursor.execute(query)
-        rows = cursor.fetchall()
-        conn.close()
-
-        for (spawn_id, tag_json_str) in rows:
-            try:
-                tag_dict = json.loads(tag_json_str)
-            except json.JSONDecodeError:
-                continue
-            tag_dict["spawn_id"] = spawn_id
-            results.append(tag_dict)
-    except sqlite3.Error as e:
-        logger.error(f"SQLite error while reading DB: {e}")
-    return results
 
 
 ###############################################################################
@@ -1356,41 +1288,62 @@ def group_tracks_by_genre(all_tracks: List[dict]) -> Dict[str, List[dict]]:
     return dict(clusters)
 
 
-def merge_similar_clusters(clusters, threshold=0.97):
-    """
-    clusters: dict mapping cluster_id to list of track dictionaries.
-              Each track is expected to have an 'embedding' key.
-    threshold: cosine similarity threshold above which clusters are merged.
-    """
+def merge_similar_clusters_with_breadth(clusters: Dict[str, List[dict]], embeddings: Dict[str, np.ndarray],
+                                          centroid_threshold: float = 0.97, breadth_tolerance: float = 0.5) -> Dict[str, List[dict]]:
+    cluster_stats = {}
+    def extract_genre_tokens(track_list):
+        genre_tokens = set()
+        for track in track_list:
+            if "spawnre" in track and track["spawnre"]:
+                genre_tokens.update(track["spawnre"].split(","))
+            if "spawnre_hex" in track and track["spawnre_hex"]:
+                hex_decoded = decode_spawnre_hex(track["spawnre_hex"])
+                genre_tokens.update(hex_decoded.split(","))
+        if not genre_tokens:
+            genre_tokens.add("unknown_genre")
+        return genre_tokens
 
-    # Compute centroids for each cluster
-    centroids = {
-        cid: np.mean([track['embedding'] for track in tracks if 'embedding' in track], axis=0)
-        for cid, tracks in clusters.items()
-    }
-    
-    labels = list(centroids.keys())
+    for cid, tracks in clusters.items():
+        emb_list = [
+            embeddings[t.get("spawn_id") or t.get("local_id")]
+            for t in tracks
+            if (t.get("spawn_id") or t.get("local_id")) in embeddings
+        ]
+        if emb_list:
+            arr = np.vstack(emb_list)
+            centroid = arr.mean(axis=0)
+            breadth = sum(np.linalg.norm(emb - centroid) for emb in emb_list) / len(emb_list)
+            genre_tokens = extract_genre_tokens(tracks)
+            cluster_stats[cid] = (centroid, breadth, genre_tokens)
+        else:
+            cluster_stats[cid] = (None, None, {"unknown_genre"})
+    labels = list(cluster_stats.keys())
     merged_clusters = {}
     merged = set()
-    
     for i, label_i in enumerate(labels):
         if label_i in merged:
             continue
-        # Start with current cluster
         current_cluster = clusters[label_i][:]
-        centroid_i = centroids[label_i]
-        
+        centroid_i, breadth_i, genres_i = cluster_stats[label_i]
         for j in range(i + 1, len(labels)):
             label_j = labels[j]
             if label_j in merged:
                 continue
-            centroid_j = centroids[label_j]
+            centroid_j, breadth_j, genres_j = cluster_stats[label_j]
+            if centroid_i is None or centroid_j is None:
+                continue
             sim = cosine_similarity(centroid_i.reshape(1, -1), centroid_j.reshape(1, -1))[0][0]
-            if sim > threshold:
-                current_cluster.extend(clusters[label_j])
-                merged.add(label_j)
+            if sim > centroid_threshold:
+                if breadth_i is not None and breadth_j is not None:
+                    avg_breadth = (breadth_i + breadth_j) / 2
+                    rel_diff = abs(breadth_i - breadth_j) / avg_breadth if avg_breadth > 0 else 0
+                    if rel_diff > breadth_tolerance:
+                        continue
+                common_genres = genres_i.intersection(genres_j)
+                if len(common_genres) >= 1:
+                    current_cluster.extend(clusters[label_j])
+                    merged.add(label_j)
         merged_clusters[label_i] = current_cluster
-    
     return merged_clusters
 
 
@@ -1742,7 +1695,7 @@ def track_file_exists(track_info: dict, spawn_root: str) -> Optional[str]:
     artist = safe_extract_first(track_info, "©ART", normalize=False) or "Unknown"
     album  = safe_extract_first(track_info, "©alb", normalize=False) or "Unknown"
     title  = safe_extract_first(track_info, "©nam", normalize=False) or "Untitled"
-    spawn_id = track_info.get("spawn_id", "unknown")
+    spawn_id = track_info.get("spawn_id") or track_info.get("local_id") or "unknown"
 
     disc_tag = track_info.get("disk")
     track_tag = track_info.get("trkn")
@@ -1782,9 +1735,9 @@ def track_file_exists(track_info: dict, spawn_root: str) -> Optional[str]:
     raw_artist = track_info.get("©ART")
     raw_album = track_info.get("©alb")
     raw_title = track_info.get("©nam")
-    print(f"\n[DEBUG] Raw values: Artist: {raw_artist}, Album: {raw_album}, Title: {raw_title}")
-    print(f"[DEBUG] Attempting file path: {abs_path}")
-    print(f"[DEBUG] Attempting sanitized path: {sanitized_path}")
+    #print(f"\n[DEBUG] Raw values: Artist: {raw_artist}, Album: {raw_album}, Title: {raw_title}")
+    #print(f"[DEBUG] Attempting file path: {abs_path}")
+    #print(f"[DEBUG] Attempting sanitized path: {sanitized_path}")
 
     return None
 

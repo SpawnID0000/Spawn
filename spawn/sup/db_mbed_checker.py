@@ -119,14 +119,13 @@ case = "change"  # Set to "ignore" to leave files unchanged or "change" to updat
 
 def build_spawnid_to_filepath(music_dir: str) -> dict:
     """
-    Walks the Music directory and returns a dict mapping each spawn_id (extracted from the m4a file tags)
-    to its file path.
+    Walks the Music directory and returns a dict mapping each spawn_ID or local_ID
+    (extracted from m4a file tags) to its file path.
     Skips hidden files.
     """
     logger.debug("Building mapping of Spawn IDs to file paths in %s", music_dir)
     mapping = {}
     for root, dirs, files in os.walk(music_dir):
-        # Skip hidden directories
         dirs[:] = [d for d in dirs if not d.startswith(".")]
         for file in files:
             if file.lower().endswith(".m4a") and not file.startswith("."):
@@ -134,32 +133,35 @@ def build_spawnid_to_filepath(music_dir: str) -> dict:
                 try:
                     audio = mutagen.mp4.MP4(file_path)
                     tags = audio.tags
-                    if tags and "----:com.apple.iTunes:spawn_ID" in tags:
-                        raw = tags["----:com.apple.iTunes:spawn_ID"][0]
-                        if isinstance(raw, bytes):
-                            sid = raw.decode("utf-8", errors="replace").strip()
+                    sid = None
+                    if tags:
+                        if "----:com.apple.iTunes:spawn_ID" in tags:
+                            raw = tags["----:com.apple.iTunes:spawn_ID"][0]
+                        elif "----:com.apple.iTunes:local_ID" in tags:
+                            raw = tags["----:com.apple.iTunes:local_ID"][0]
                         else:
-                            sid = str(raw).strip()
-                        if sid:
-                            mapping[sid] = file_path
-                            logger.debug(f"Mapping spawn ID {sid} to {file_path}")
+                            continue
+                        sid = raw.decode("utf-8", errors="replace").strip() if isinstance(raw, bytes) else str(raw).strip()
+                    if sid:
+                        mapping[sid] = file_path
+                        logger.debug(f"Mapping ID {sid} to {file_path}")
                 except Exception as e:
                     logger.error(f"Error reading file {file_path}: {e}")
     return mapping
 
-def load_spawn_ids_from_db(db_path: str) -> List[str]:
+def load_spawn_ids_from_db(db_path: str, table_name: str = "tracks") -> List[str]:
     """
-    Returns a list of all spawn_id values from the 'tracks' table of spawn_catalog.db.
+    Returns a list of all spawn_id values from the given table in the database.
     """
-    logger.debug("Loading Spawn IDs from database %s", db_path)
+    logger.debug(f"Loading Spawn IDs from table '{table_name}' in database {db_path}")
     spawn_ids = []
     conn = None
     try:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
-        cur.execute("SELECT spawn_id FROM tracks")
+        cur.execute(f"SELECT spawn_id FROM {table_name}")
         rows = cur.fetchall()
-        spawn_ids = [row[0] for row in rows]
+        spawn_ids = [row[0] for row in rows if row[0]]
         logger.debug("Loaded %d Spawn IDs from DB", len(spawn_ids))
     except Exception as e:
         logger.error("Failed to load Spawn IDs from DB: %s", e)
@@ -274,37 +276,45 @@ def check_m4a_files(music_dir: str, db_spawn_ids_set: set, emb_spawn_ids_set: se
                     except Exception as e:
                         logger.error(f"Failed to save updated tags for {file_path}: {e}")
 
-                # Check for the spawn_ID tag (using the canonical name).
-                if tags and "----:com.apple.iTunes:spawn_ID" in tags:
-                    logger.debug(f"Found spawn_ID tag in: {file_path}")
-                    # Assuming the tag's value is a list with a byte string.
-                    raw = tags["----:com.apple.iTunes:spawn_ID"][0]
-                    spawn_id = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
-                    spawn_id = spawn_id.strip()
-                    spawn_id_counts[spawn_id] = spawn_id_counts.get(spawn_id, 0) + 1
-                    logger.debug(f"Found spawn_ID {spawn_id} in {file_path}")
-                    if spawn_id not in db_spawn_ids_set:
-                        unmatched_files.append((file_path, spawn_id))
+                # Try spawn_ID, then fallback to local_ID
+                track_id = None
+                if tags:
+                    if "----:com.apple.iTunes:spawn_ID" in tags:
+                        raw = tags["----:com.apple.iTunes:spawn_ID"][0]
+                    elif "----:com.apple.iTunes:local_ID" in tags:
+                        raw = tags["----:com.apple.iTunes:local_ID"][0]
+                    else:
+                        untagged_files.append(file_path)
+                        continue
+                    track_id = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+                    track_id = track_id.strip()
+
+                if track_id:
+                    spawn_id_counts[track_id] = spawn_id_counts.get(track_id, 0) + 1
+                    if track_id not in db_spawn_ids_set:
+                        unmatched_files.append((file_path, track_id))
                 else:
                     untagged_files.append(file_path)
+
             except Exception as e:
                 logger.error(f"Error reading {file_path}: {e}")
 
     if untagged_files:
-        logger.warning("The following .m4a files are missing a spawn_id tag:")
+        logger.warning("The following .m4a files are missing a spawn_ID or local_ID tag:")
         for file in untagged_files:
             logger.warning(f"  {file}")
 
     if unmatched_files:
-        logger.warning("The following .m4a files have spawn_id values that do not match any database entry:")
-        for file, spawn_id in unmatched_files:
-            logger.warning(f"  {file} (spawn_id: {spawn_id})")
+        logger.warning("The following .m4a files have spawn_ID/local_ID values not found in the database:")
+        for file, tid in unmatched_files:
+            logger.warning(f"  {file} (ID: {tid})")
 
     duplicates = {sid: count for sid, count in spawn_id_counts.items() if count > 1}
     if duplicates:
-        logger.warning(f"The following {len(duplicates)} spawn_ids are duplicated across multiple .m4a files:")
+        logger.warning(f"The following {len(duplicates)} IDs are duplicated across multiple .m4a files:")
         for sid, count in duplicates.items():
-            logger.warning(f"  spawn_id: {sid} appears {count} times")
+            logger.warning(f"  ID: {sid} appears {count} times")
+
     logger.info(f"Checked {checked_files} .m4a files.")
 
 def main() -> None:
@@ -315,6 +325,8 @@ def main() -> None:
                         help="Path to the Spawn project root (e.g. LIB_PATH/Spawn).")
     parser.add_argument("--tfidf", action="store_true",
                         help="Use TF-IDF embeddings (mp4tovecTFIDF.p) instead of standard embeddings.")
+    parser.add_argument("--local", action="store_true",
+                        help="Use local (user-mode) embeddings from mp4tovec_local.p instead of catalog.")
     parser.add_argument("--max_workers", type=int, default=1,
                         help="Maximum number of worker processes (optional).")
     parser.add_argument("--batch_size", type=int, default=1000,
@@ -326,13 +338,22 @@ def main() -> None:
 
     logger.debug("Starting db_mbed_checker...")
     spawn_root_abs = os.path.abspath(args.spawn_root)
-    db_path = os.path.join(spawn_root_abs, "aux", "glob", "spawn_catalog.db")
-    # Choose pickle file based on --tfidf flag.
-    if args.tfidf:
+    if args.local:
+        db_path = os.path.join(spawn_root_abs, "aux", "user", "spawn_library.db")
+        table_name = "lib_tracks"
+    else:
+        db_path = os.path.join(spawn_root_abs, "aux", "glob", "spawn_catalog.db")
+        table_name = "tracks"
+    # Choose pickle file based on flag (none, --tfidf, or --local).
+    if args.local:
+        pickle_file_name = "mp4tovec_local.p"
+        pickle_path = os.path.join(spawn_root_abs, "aux", "user", pickle_file_name)
+    elif args.tfidf:
         pickle_file_name = "mp4tovecTFIDF.p"
+        pickle_path = os.path.join(spawn_root_abs, "aux", "glob", pickle_file_name)
     else:
         pickle_file_name = "mp4tovec.p"
-    pickle_path = os.path.join(spawn_root_abs, "aux", "glob", pickle_file_name)
+        pickle_path = os.path.join(spawn_root_abs, "aux", "glob", pickle_file_name)
     music_dir = os.path.join(spawn_root_abs, "Music")
 
     # Check existence of required files/directories.
@@ -363,7 +384,7 @@ def main() -> None:
             sys.exit(1)
 
     # Load DB spawn_ids.
-    db_spawn_ids = load_spawn_ids_from_db(db_path)
+    db_spawn_ids = load_spawn_ids_from_db(db_path, table_name=table_name)
     db_spawn_ids_set = set(db_spawn_ids)
     logger.info(f"Loaded {len(db_spawn_ids)} Spawn IDs from database.")
 
@@ -412,6 +433,47 @@ def main() -> None:
                 logger.error(f"Failed to update {pickle_file_name}: {e}")
         else:
             logger.info("No missing spawn_ids in TF-IDF embeddings.")
+    else:
+        # For non-TFIDF modes (--local or no flag), auto-generate missing embeddings using MP4ToVec.
+        missing_in_pickle = db_spawn_ids_set - emb_spawn_ids_set
+        if missing_in_pickle:
+            logger.info(f"{len(missing_in_pickle)} spawn_ids are missing from the pickle file in non-TFIDF mode.")
+            spawnid_to_file = build_spawnid_to_filepath(music_dir)
+            try:
+                from spawn.MP4ToVec import load_mp4tovec_model_diffusion, generate_embedding
+                model = load_mp4tovec_model_diffusion()
+            except Exception as e:
+                logger.error(f"Failed to load MP4ToVec model: {e}")
+                model = None
+            if model is None:
+                logger.info("MP4ToVec model not available; cannot generate missing embeddings.")
+            else:
+                for sid in missing_in_pickle:
+                    if sid in spawnid_to_file:
+                        file_path = spawnid_to_file[sid]
+                        logger.info(f"Generating embedding for spawn_id {sid} from file {file_path}")
+                        try:
+                            embedding = generate_embedding(file_path, model)
+                            if embedding is not None:
+                                emb_dict[sid] = embedding
+                                logger.info(f"Generated and added embedding for {sid}")
+                            else:
+                                logger.warning(f"No valid embedding found for {sid} from file {file_path}")
+                        except Exception as e:
+                            logger.error(f"Failed to process {sid} from file {file_path}: {e}")
+                    else:
+                        logger.warning(f"Could not find audio file for spawn_id {sid} in Music directory")
+                try:
+                    with open(pickle_path, "wb") as f:
+                        pickle.dump(emb_dict, f)
+                    logger.info(f"Updated {pickle_file_name} with generated embeddings for missing spawn_ids")
+                except Exception as e:
+                    logger.error(f"Failed to update {pickle_file_name}: {e}")
+        else:
+            logger.info("No missing spawn_ids in embeddings.")
+
+    # Update emb_spawn_ids_set after potential modifications
+    emb_spawn_ids_set = set(emb_dict.keys())
 
     # Compare DB spawn_ids with embedding spawn_ids.
     check_spawn_ids(db_spawn_ids_set, emb_spawn_ids_set, emb_dict, pickle_path)
