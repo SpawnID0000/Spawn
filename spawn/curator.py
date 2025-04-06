@@ -219,8 +219,8 @@ def get_album_candidate_blocks_for_cluster(cluster_key: str,
         if album_tracks:
             # Sort album tracks in sequential order.
             album_tracks = sorted(album_tracks, key=get_track_order)
-            first_spawn = album_tracks[0].get("spawn_id")
-            last_spawn  = album_tracks[-1].get("spawn_id")
+            first_spawn = (album_tracks[0].get("spawn_id") or "").strip().lower()
+            last_spawn  = (album_tracks[-1].get("spawn_id") or "").strip().lower()
             if first_spawn in embeddings and last_spawn in embeddings:
                 # Look up the album comment from album_comments.
                 album_comment = album_comments.get(album, "")
@@ -273,7 +273,18 @@ def assign_albums_to_clusters(excluded_album_m3us: List[str],
         album_tracks = [t for t in all_tracks if
                         (safe_extract_first(t, "©ART", normalize=False) or "").strip().lower() == album_id[0] and
                         (safe_extract_first(t, "©alb", normalize=False) or "").strip().lower() == album_id[1]]
-        album_embs = [embeddings[t.get("spawn_id")] for t in album_tracks if t.get("spawn_id") in embeddings]
+
+        # print(f"[DEBUG] Album ID: {album_id}, Number of tracks: {len(album_tracks)}")
+        # for t in album_tracks:
+        #     raw_id = t.get("spawn_id") or t.get("local_id")
+        #     lookup_id = (raw_id or "").strip().lower()
+        #     has_embed = lookup_id in embeddings
+        #     print(f"  - Track ID: {raw_id}, Normalized: {lookup_id}, In embeddings: {has_embed}")
+
+        album_embs = [
+            embeddings[sid] for t in album_tracks
+            if (sid := (t.get("spawn_id") or t.get("local_id") or "").strip().lower()) in embeddings
+        ]
         if not album_embs:
             print(f"[DEBUG] No embeddings for album {album_id}; skipping.")
             continue
@@ -872,6 +883,8 @@ def run_curator(spawn_root: str, is_admin: bool = True):
         print("\n[Summary of curated clusters]:")
 
     for g, tracks in curated_clusters:
+        if not tracks:  # Skip clusters with no tracks
+            continue
         print(f"\n  * {g} => {len(tracks)} tracks")
         # If spawnre_hex
         if g.startswith("x"):
@@ -1636,6 +1649,8 @@ def write_curated_m3u(
             f.write("\n")
 
             for (genre_key, track_list) in curated_clusters:
+                if not track_list:  # Skip empty clusters (e.g. outliers with 0 tracks)
+                    continue
                 # Write a header for the cluster
                 if genre_key.startswith("x"):
                     f.write(f"# SPAWNRE_HEX: {genre_key}\n")

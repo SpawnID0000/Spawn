@@ -12,7 +12,7 @@ if readme_path.exists():
 
 setup(
     name="Spawn",
-    version="0.0.21",
+    version="0.0.22",
     packages=find_packages(include=["spawn", "spawn.*"]),
     install_requires=[
         "mutagen>=1.45.1",
@@ -31,7 +31,8 @@ setup(
         #"tensorflow-metal",
         "torch>=2.0.0",
         #"audiodiffusion>=0.1.0",
-        "safetensors>=0.3.1"
+        "safetensors>=0.3.1",
+        "pandas>=1.3.0"
     ],
     entry_points={
         "console_scripts": [
