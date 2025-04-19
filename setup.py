@@ -12,7 +12,7 @@ if readme_path.exists():
 
 setup(
     name="Spawn",
-    version="0.0.22",
+    version="0.0.23",
     packages=find_packages(include=["spawn", "spawn.*"]),
     install_requires=[
         "mutagen>=1.45.1",
