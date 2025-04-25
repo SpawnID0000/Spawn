@@ -90,6 +90,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from difflib import SequenceMatcher
 from requests.exceptions import SSLError
+from scipy.spatial.distance import cosine
 
 from spawn.dic_spawnre import genre_mapping, genre_synonyms, subgenre_to_parent
 
@@ -141,6 +142,8 @@ spawn_id_to_embeds = {}
 local_user_embeddings = {}
 MP4TOVEC_MODEL = None
 MP4TOVEC_AVAILABLE = False
+
+EMBEDDING_DUPLICATE_THRESHOLD = 0.99999
 
 try:
     from spawn.MP4ToVec import load_mp4tovec_model_diffusion, generate_embedding
@@ -851,6 +854,94 @@ def check_for_potential_match_in_db(conn, current_tags, current_spawn_id=None, s
     return found_any_match
 
 
+def check_for_potential_match_in_mbed(
+    current_tags_map: dict,
+    new_file_paths_map: dict,
+    new_embeddings: dict,
+    existing_embeddings: dict,
+    threshold: float = EMBEDDING_DUPLICATE_THRESHOLD
+):
+    """
+    After generating embeddings for new imports, compare each new track
+    against existing embeddings to catch likely duplicates.
+
+    current_tags_map: {spawn_id: tags_dict} for each new track
+    new_embeddings:    {spawn_id: numpy.ndarray} for new tracks
+    existing_embeddings: {spawn_id: numpy.ndarray} already in EMBED_PATH
+    threshold: cosine similarity above which we warn the user
+    """
+    removed = []
+
+    for new_id, new_vec in list(new_embeddings.items()):
+        # skip if this ID was already in the existing set
+        if new_id in existing_embeddings:
+            continue
+
+        # find closest existing embedding
+        best_sim = -1.0
+        best_id  = None
+        for exist_id, exist_vec in existing_embeddings.items():
+            sim = 1.0 - cosine(new_vec, exist_vec)
+            if sim > best_sim:
+                best_sim = sim
+                best_id  = exist_id
+
+        if best_sim >= threshold:
+            print(f"\n⚠️  Potential duplicate by embedding: "
+                  f"new track {new_id} ≈ {best_id} (similarity {best_sim:.3f})")
+            resp = input("Treat as duplicate? ([y]/n): ").strip().lower() or "y"
+            if resp == "y":
+
+                # 1) Temporarily force a metadata‐difference so handle_existing_spawn_id will prompt
+                _orig_md = metadata_differs
+                try:
+                    globals()['metadata_differs'] = lambda a, b: True
+                    db_tags       = fetch_tags_from_db(best_id)
+                    incoming_tags = current_tags_map[new_id]
+                    handle_existing_spawn_id(
+                        best_id,
+                        db_tags,
+                        incoming_tags,
+                        [False],                        # any_db_changes_ref
+                        new_file_paths_map.get(new_id),# new file path
+                        set(),                          # overridden_spawn_ids
+                        set()                           # donotupdate_spawn_ids
+                    )
+                finally:
+                    globals()['metadata_differs'] = _orig_md
+
+                # 2) Log that we’re dropping the duplicate
+                logger.info(f"[EMBEDDING] Duplicate match: not importing {new_id}, matches existing {best_id}")
+
+                # 3) Write blank .txt marker + remove the .m4a
+                new_file_path = new_file_paths_map.get(new_id)
+                if new_file_path:
+                    rel = os.path.relpath(new_file_path, start=OUTPUT_PARENT_DIR)
+                    base, _ = os.path.splitext(rel)
+                    licn_root = os.path.join(os.path.dirname(OUTPUT_PARENT_DIR),
+                                             "aux", "user", "licn")
+                    txt_path = os.path.join(licn_root, base + ".txt")
+                    os.makedirs(os.path.dirname(txt_path), exist_ok=True)
+                    with open(txt_path, "w", encoding="utf-8"):
+                        pass
+                    logger.info(f"Blank txt file created => {txt_path}")
+                    try:
+                        os.remove(new_file_path)
+                        logger.info(f"Removed embedding‐duplicate file: {new_file_path}")
+                    except FileNotFoundError:
+                        logger.warning(f"File not found when removing duplicate: {new_file_path}")
+                    except Exception as e:
+                        logger.warning(f"Error removing file {new_file_path}: {e}")
+
+                # 4) Pop its embedding & mark it removed
+                new_embeddings.pop(new_id, None)
+                removed.append(new_id)
+
+            else:
+                print(f"✔ Keeping {new_id} as a unique import.\n")
+    return removed
+
+
 def fetch_matching_spawn_id_from_db(incoming_tags):
     """
     Finds the catalog row that matches these tags (via artist/title partial match)
@@ -858,7 +949,7 @@ def fetch_matching_spawn_id_from_db(incoming_tags):
     If no single match, returns None.
     """
     def _tag_to_str(val):
-        # same logic you use in check_for_potential_match_in_db
+        # same logic used in check_for_potential_match_in_db
         if isinstance(val, list) and val:
             val = val[0]
         if isinstance(val, MP4FreeForm):
@@ -4841,15 +4932,18 @@ def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_
         new_filename = build_d_tt_title_filename(disc_main, track_main, track_title_str, spawn_id_str=spawn_id_str)
         old_dir = os.path.dirname(old_path)
         new_path = os.path.join(old_dir, new_filename)
-        if os.path.abspath(old_path) != os.path.abspath(new_path):
+        if os.path.exists(new_path):
+            # Library already has this file—skip overwriting it.
+            logger.info(f"Target exists, skipping rename of duplicate import: {new_path}")
+            # Keep old_path (the temp import) around so it can be deleted below
+            all_tracks[idx] = (old_path, track_tags, id_str)
+        else:
             try:
                 os.rename(old_path, new_path)
                 logger.info(f"Renamed => {new_path}")
                 all_tracks[idx] = (new_path, track_tags, id_str)
             except OSError as e:
                 logger.warning(f"Unable to rename file: {e}")
-        else:
-            logger.debug(f"File already named {new_path}, skipping rename.")
         try:
             audio = MP4(new_path)
             audio["----:com.apple.iTunes:spawn_ID"] = [MP4FreeForm(spawn_id_str.encode("utf-8"))]
@@ -4861,7 +4955,71 @@ def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_
             logger.warning(f"Failed to write spawn_ID to {new_path}: {e}")
 
     logger.info("All files renamed to D-TT [spawn_id] - title.m4a format.\n")
+
+    # ─── Load existing embeddings ───
+    existing_embeddings = {}
+    if os.path.exists(EMBED_PATH):
+        with open(EMBED_PATH, "rb") as f:
+            existing_embeddings = pickle.load(f)
+
+    # collect any spawn_ids the user confirms as duplicates
+    removed_ids = set()
+
+    # Build maps from all_tracks (which is in scope) for the embedding check
+    # only include entries where track_tags isn’t None
+    current_tags_map   = { id_str: tags  for (path,tags,id_str) in all_tracks if tags }
+    new_file_paths_map = { id_str: path  for (path,tags,id_str) in all_tracks if tags }
+
+    # ─── Embeddings Generation & Duplicate Check ───
+    if is_admin:
+        for (track_path, track_tags, id_str) in all_tracks:
+            if not track_tags:
+                continue
+            # extract spawn_id_str as before...
+            spawn_vec_id = id_str
+            generate_deejai_embedding_for_track(track_path, spawn_vec_id)
+        if spawn_id_to_embeds:
+            # run duplicate check, remove confirmed duplicates from the embed dict
+            newly_removed = check_for_potential_match_in_mbed(
+                current_tags_map,
+                new_file_paths_map,
+                spawn_id_to_embeds,
+                existing_embeddings,
+                threshold=EMBEDDING_DUPLICATE_THRESHOLD
+            )
+            removed_ids.update(newly_removed)
+            # drop those from all_tracks so DB‐insertion skips them
+            for idx, (p, tags, sid) in enumerate(all_tracks):
+                if sid in removed_ids:
+                    all_tracks[idx] = (p, None, sid)
+            # now save only the survivors
+            existing_embeddings.update(spawn_id_to_embeds)
+            save_combined_embeddings(EMBED_PATH, existing_embeddings)
+            spawn_id_to_embeds.clear()
+    else:
+        for (track_path, track_tags, id_str) in all_tracks:
+            if not track_tags:
+                continue
+            generate_deejai_embedding_for_track(track_path, id_str)
+            if id_str in spawn_id_to_embeds:
+                local_user_embeddings[id_str] = spawn_id_to_embeds.pop(id_str)
+        if local_user_embeddings:
+            newly_removed = check_for_potential_match_in_mbed(
+                current_tags_map,
+                new_file_paths_map,
+                local_user_embeddings,
+                existing_embeddings,
+                threshold=EMBEDDING_DUPLICATE_THRESHOLD
+            )
+            removed_ids.update(newly_removed)
+            for idx, (p, tags, sid) in enumerate(all_tracks):
+                if sid in removed_ids:
+                    all_tracks[idx] = (p, None, sid)
+            save_combined_embeddings(USER_EMBED_PATH, local_user_embeddings)
+            local_user_embeddings.clear()
+
     logger.info("=== Duplicate-checking & Database Update for current mini-batch ===")
+
     if is_admin:
         latest_rev = get_latest_db_rev(DB_PATH)
         logger.info(f"Current DB revision: {latest_rev}\n")
@@ -4874,6 +5032,9 @@ def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_
 
     newly_imported_tracks = []
     for idx, (track_path, track_tags, id_str) in enumerate(all_tracks):
+        # skip anything the user marked as an embedding‐duplicate
+        if id_str in removed_ids:
+            continue
         final_temp_tags = extract_desired_tags(track_path)
         if not final_temp_tags:
             logger.info(f"No tags found for DB insertion: {track_path}")
@@ -4975,9 +5136,25 @@ def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_
                 parts = latest_rev.split(".")
                 old_count_for_rev = int(parts[1]) if len(parts) > 1 else 0
             new_count = get_total_track_count(DB_PATH)
-            db_rev_val = next_db_revision(latest_rev if latest_rev else "", old_count_for_rev, new_count)
-            store_db_revision(DB_PATH, db_rev_val)
-            logger.info(f"Updated db_rev='{db_rev_val}' due to database changes.")
+            # only bump the revision if new tracks were actually imported during this run
+            if newly_imported_tracks and new_count > old_count_for_rev:
+                db_rev_val = next_db_revision(latest_rev or "", old_count_for_rev, new_count)
+                store_db_revision(DB_PATH, db_rev_val)
+                logger.info(f"Updated db_rev='{db_rev_val}' (new tracks imported).")
+            else:
+                logger.info("No new tracks imported; db_rev not incremented.")
+        # Cleanup any stray catalog rows for embedding‐duplicates
+        if is_admin and removed_ids:
+            conn = sqlite3.connect(DB_PATH)
+            cur  = conn.cursor()
+            for rid in removed_ids:
+                try:
+                    cur.execute("DELETE FROM tracks WHERE spawn_id = ?", (rid,))
+                    logger.info(f"Purged stray duplicate catalog record for spawn_id {rid}")
+                except Exception as e:
+                    logger.warning(f"Failed to purge catalog record for {rid}: {e}")
+            conn.commit()
+            conn.close()
         else:
             logger.info("No database changes; db_rev not incremented.")
 
@@ -5032,46 +5209,6 @@ def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_
             else:
                 logger.info(f"[User Mode] No spawn_id available for track: {track_path}. Leaving tags unchanged.")
                 rewrite_tags(track_path, track_tags)
-
-    # Embeddings Generation
-    if is_admin:
-        for (track_path, track_tags, id_str) in all_tracks:
-            if track_tags is None:
-                continue
-            spawn_id_data = track_tags.get("----:com.apple.iTunes:spawn_ID")
-            if isinstance(spawn_id_data, list) and spawn_id_data:
-                spawn_id_data = spawn_id_data[0]
-            if isinstance(spawn_id_data, bytes):
-                spawn_id_data = spawn_id_data.decode("utf-8", errors="replace")
-            spawn_id_str = str(spawn_id_data).strip() if spawn_id_data else None
-            if spawn_id_str:
-                generate_deejai_embedding_for_track(track_path, spawn_id_str)
-            else:
-                logger.info(f"[MP4ToVec] No spawn_id found for track: {track_path}; skipping embedding.")
-        if spawn_id_to_embeds:
-            logger.info(f"[MP4ToVec] Saving {len(spawn_id_to_embeds)} new embeddings.")
-            save_combined_embeddings(EMBED_PATH, spawn_id_to_embeds)
-            spawn_id_to_embeds.clear()
-    else:
-        for (track_path, track_tags, id_str) in all_tracks:
-            if track_tags is None:
-                continue
-            local_id_data = track_tags.get("----:com.apple.iTunes:local_ID")
-            if isinstance(local_id_data, list) and local_id_data:
-                local_id_data = local_id_data[0]
-            if isinstance(local_id_data, bytes):
-                local_id_data = local_id_data.decode("utf-8", errors="replace")
-            local_id_str = str(local_id_data).strip() if local_id_data else None
-            if local_id_str:
-                generate_deejai_embedding_for_track(track_path, local_id_str)
-                if local_id_str in spawn_id_to_embeds:
-                    local_user_embeddings[local_id_str] = spawn_id_to_embeds.pop(local_id_str)
-            else:
-                logger.info(f"[MP4ToVec] No local_id for track: {track_path}; skipping embedding.")
-        if local_user_embeddings:
-            logger.info(f"[MP4ToVec] Saving {len(local_user_embeddings)} local embeddings.")
-            save_combined_embeddings(USER_EMBED_PATH, local_user_embeddings)
-            local_user_embeddings.clear()
     lib_base = os.path.dirname(os.path.dirname(OUTPUT_PARENT_DIR))
     logger.info("Creating symlinks for imported tracks...")
     linx_dir = os.path.join(lib_base, "Spawn", "aux", "user", "linx")
@@ -5121,6 +5258,10 @@ def run_import(output_path, music_path, skip_prompts=False, keep_matched=False,
 
         global new_admin_spawn_ids
         new_admin_spawn_ids = set()
+
+        # keep track of embeddings generated this session
+        spawn_id_to_embeds = {}
+        local_user_embeddings = {}
 
 
         SKIP_PROMPTS = skip_prompts
