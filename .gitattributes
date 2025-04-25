@@ -2,3 +2,4 @@ spawn/audio-encoder/diffusion_pytorch_model.safetensors filter=lfs diff=lfs merg
 spawn/spawn_catalog.db filter=lfs diff=lfs merge=lfs -text
 /Users/toddmarco/Documents/Python_scripts/Spawn/spawn/mp4tovec_raw.p filter=lfs diff=lfs merge=lfs -text
 spawn/mp4tovec_raw.p filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
