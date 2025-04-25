@@ -1687,7 +1687,7 @@ def main():
             finally:
                 if os.path.exists(temp_input_copy):
                     os.remove(temp_input_copy)
-                demucs_temp_dir = os.path.join(os.getcwd(), "htdemucs", "demucs_temp_input")
+                demucs_temp_dir = os.path.join(audio_dir, "htdemucs")
                 if os.path.exists(demucs_temp_dir):
                     shutil.rmtree(demucs_temp_dir)
 

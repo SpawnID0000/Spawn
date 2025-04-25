@@ -2,7 +2,7 @@
 # 🚫 Ignore API Credentials
 # ===============================
 # Prevent committing API keys and configuration files.
-spawn/APIds.env
+spawn/APId.env
 spawn/settings.env
 
 # ===============================
