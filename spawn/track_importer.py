@@ -1262,6 +1262,7 @@ DESIRED_TAGS = [
     "©wrt",  # Composer
     "©lyr",  # Lyrics
     "covr",  # Album art
+    "rtng",  # Explicit/Clean advisory rating
 
     # MusicBrainz:
     "----:com.apple.iTunes:MusicBrainz Artist Id",
