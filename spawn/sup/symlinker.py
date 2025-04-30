@@ -54,6 +54,17 @@ def extract_spawn_id(file_path: str) -> str:
         logger.error(f"Error reading Spawn ID from {file_path}: {e}")
         return ""
 
+def find_track_by_spawn_id(spawn_id: str, music_dir: str) -> str:
+    """Search the Music directory for a file with the given Spawn ID tag."""
+    for root, _, files in os.walk(music_dir):
+        for file in files:
+            if file.lower().endswith(".m4a") and not file.startswith("."):
+                track_path = os.path.join(root, file)
+                spid = extract_spawn_id(track_path)
+                if spid == spawn_id:
+                    return os.path.abspath(track_path)
+    return ""
+
 def create_symlink_for_track(track_path: str, spawn_root: str, spawn_id: str) -> None:
     """
     Create a symbolic link for the track file in spawn_root/aux/user/linx/ named
@@ -149,9 +160,19 @@ def main():
     if not os.path.isdir(spawn_root):
         logger.error(f"Spawn directory not found at {spawn_root}")
         sys.exit(1)
-    if not os.path.isdir(music_dir):
-        logger.error(f"Music directory not found at {music_dir}")
-        sys.exit(1)
+
+    # If not in -linx mode, require Music/ to exist up front
+    if not args.linx:
+        if not os.path.isdir(music_dir):
+            logger.error(f"Music directory not found at {music_dir}")
+            sys.exit(1)
+    else:
+        # In -linx mode, prompt once if Music/ is missing
+        if not os.path.isdir(music_dir):
+            music_dir = input("\nMusic directory not found—enter path to Music folder: ").strip()
+            if not os.path.isdir(music_dir):
+                logger.error(f"Invalid Music folder: {music_dir}")
+                sys.exit(1)
 
     if args.all:
         mode = args.all.lower()
@@ -180,7 +201,12 @@ def main():
             if missing_ids:
                 print("\nSpawn IDs present in the DB but missing in the symlink folder:")
                 for sid in sorted(missing_ids):
-                    print(f"  {sid}")
+                    target_path = find_track_by_spawn_id(sid, music_dir)
+                    if target_path:
+                        create_symlink_for_track(target_path, spawn_root, sid)
+                        print(f"  Created symlink for {sid}")
+                    else:
+                        print(f"  Could not create symlink for {sid} — matching file not found")
             else:
                 print("\nAll Spawn IDs from the database have corresponding symlinks.")
             if extra_ids:
@@ -203,17 +229,34 @@ def main():
                 print("\nNo extra Spawn IDs found in the symlink folder.")
             if broken_links:
                 print("\nSymlinks with broken targets (missing actual file):")
+                still_broken = []
+
+                # 1) Attempt auto-repair on each
                 for sid in sorted(broken_links):
                     print(f"  {sid}")
-                # Prompt user for removal of broken symlinks
-                if input("\nWould you like to remove these broken symlink files? ([y]/n): ").strip().lower() != "n":
-                    for sid in sorted(broken_links):
+                    target_path = find_track_by_spawn_id(sid, music_dir)
+                    if target_path:
                         symlink_path = os.path.join(linx_dir, f"{sid}.m4a")
                         try:
                             os.remove(symlink_path)
-                            print(f"Removed broken symlink: {symlink_path}")
+                            os.symlink(target_path, symlink_path)
+                            print(f"    Repaired symlink for {sid} → {target_path}")
                         except Exception as e:
-                            logger.error(f"Error removing broken symlink {symlink_path}: {e}")
+                            logger.error(f"    Failed to repair {sid}: {e}")
+                            still_broken.append(sid)
+                    else:
+                        print(f"    Unable to auto-repair {sid}; Spawn ID exists in DB but file not found.")
+                        still_broken.append(sid)
+
+                # 2) Prompt to delete any that remain broken
+                if still_broken and input("\nRemove these broken symlinks? ([y]/n): ").strip().lower() != "n":
+                    for sid in still_broken:
+                        sp = os.path.join(linx_dir, f"{sid}.m4a")
+                        try:
+                            os.remove(sp)
+                            print(f"    Removed broken symlink: {sp}")
+                        except Exception as e:
+                            logger.error(f"    Error removing {sp}: {e}")
             else:
                 print("\nAll symlinks point to existing files.")
         else:
