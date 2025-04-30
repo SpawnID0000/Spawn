@@ -96,6 +96,17 @@ def main():
 
     current_dir = os.path.dirname(__file__)
 
+    # Ensure default .env files exist by copying from .example files if needed
+    for env_basename in ["APId.env", "settings.env"]:
+        env_path = os.path.join(current_dir, env_basename)
+        example_path = env_path + ".example"
+        if not os.path.exists(env_path) and os.path.exists(example_path):
+            try:
+                shutil.copyfile(example_path, env_path)
+                print(f"[SETUP] {env_basename} not found. Copied from {env_basename}.example.")
+            except Exception as e:
+                print(f"[ERROR] Failed to copy {env_basename}: {e}")
+
     # Load APId.env
     apid_env = os.path.join(current_dir, "APId.env")
     load_dotenv(apid_env)
