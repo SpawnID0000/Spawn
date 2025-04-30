@@ -1085,9 +1085,18 @@ def handle_existing_spawn_id(
     user_prompt = (
         "Existing Spawn ID found with conflicting metadata.\n"
         "Enter 'override' if the match is inaccurate.\n"
-        "Otherwise, would you like to update the catalog database? (y/[n]): "
+        "Otherwise, would you like to update the catalog database? (y/n): "
     )
-    user_in = get_user_input(user_prompt, default="n").strip().lower()
+    valid_responses = {"override", "y", "n"}
+
+    while True:
+        user_in = get_user_input(user_prompt, default="override").strip().lower()
+
+        if user_in in valid_responses:
+            break
+        logger.info("Invalid input. Please enter 'override', 'y', or 'n'.")
+
+    user_in = get_user_input(user_prompt, default="override").strip().lower()
 
     if user_in == "override":
         # 1) Generate a new ID and assign it to incoming_tags
@@ -1130,7 +1139,7 @@ def handle_existing_spawn_id(
         # Return None to indicate we kept the same spawn ID
         return None
 
-    else:
+    elif user_in == "n":
         # user_in == "n" => revert the new file's tags to match DB
         logger.info(
             f"User chose NOT to update DB for spawn_id={spawn_id_str}. "
