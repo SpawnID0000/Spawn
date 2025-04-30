@@ -4924,7 +4924,7 @@ def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_
         rewrite_tags(track_path, final_tags)
         logger.debug(f"Final tags for {track_path}: {final_tags}")
 
-    logger.info("")
+    print()
     logger.info("=== Renaming files to D-TT [spawn_id] - title.m4a ===")
     for idx, (old_path, track_tags, id_str) in enumerate(all_tracks):
         disc_tag = track_tags.get("disk")
@@ -5220,6 +5220,7 @@ def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_
                 logger.info(f"[User Mode] No spawn_id available for track: {track_path}. Leaving tags unchanged.")
                 rewrite_tags(track_path, track_tags)
     lib_base = os.path.dirname(os.path.dirname(OUTPUT_PARENT_DIR))
+    print()
     logger.info("Creating symlinks for imported tracks...")
     linx_dir = os.path.join(lib_base, "Spawn", "aux", "user", "linx")
     os.makedirs(linx_dir, exist_ok=True)
@@ -5230,7 +5231,8 @@ def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_
             create_symlink_for_track(track_path, lib_base, id_str)
         else:
             logger.warning(f"No spawn_id or local_id for track {track_path}; skipping symlink.")
-    logger.info("\nGenerating album M3U playlists for newly imported albums...")
+    print()
+    logger.info("Generating album M3U playlists for newly imported albums...")
     album_folders_set = set()
     for (track_path, track_tags, id_str) in all_tracks:
         if track_tags is None:
@@ -5239,7 +5241,7 @@ def post_process_imported_tracks(all_album_data, is_admin, keep_matched, lastfm_
         album_folders_set.add(album_folder)
     for album_folder in album_folders_set:
         logger.info(f"Generating album playlist for: {album_folder}")
-        generate_playlist_for_album(album_folder, linx_dir, os.path.join(os.path.dirname(OUTPUT_PARENT_DIR), "Spawn", "aux", "user", "albm"), use_absolute_paths=False)
+        generate_playlist_for_album(album_folder, linx_dir, os.path.join(os.path.dirname(OUTPUT_PARENT_DIR), "aux", "user", "albm"), use_absolute_paths=False)
     logger.info("=== Creating import M3U playlist for tracks not in catalog ===")
     base_music_dir = os.path.abspath(OUTPUT_PARENT_DIR)
     generate_import_playlist(all_tracks, base_music_dir, PLAYLISTS_DIR)
