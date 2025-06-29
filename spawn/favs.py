@@ -57,7 +57,7 @@ def update_favorites_menu(spawn_root):
         return
 
     # --- Original logic for choices 1-3 ---
-    input_path = input("Enter the path to an M3U or CSV file listing your favorites, or directly enter Spawn IDs here: ").strip()
+    input_path = input("Enter the path to an M3U, CSV, or JSON file listing your favorites, or directly enter Spawn IDs here: ").strip()
     parts = shlex.split(input_path)
     if not parts:
         print("[ERROR] No input provided.")
@@ -68,14 +68,18 @@ def update_favorites_menu(spawn_root):
     spawn_ids = []
 
     if os.path.isfile(input_path):
-        if input_path.lower().endswith(".m3u"):
+        ext = input_path.lower()
+        if ext.endswith(".m3u"):
             print("[INFO] Parsing M3U file...")
             extinf_entries = parse_m3u_custom(input_path)
-        elif input_path.lower().endswith(".csv"):
+        elif ext.endswith(".csv"):
             print("[INFO] Parsing CSV file for Spawn IDs...")
             spawn_ids = parse_csv_for_spawn_ids(input_path)
+        elif ext.endswith(".json"):
+            print("[INFO] Parsing JSON file for Spawn IDs...")
+            spawn_ids = parse_json_for_spawn_ids(input_path)
         else:
-            print("[ERROR] Unsupported file format. Please provide an M3U or CSV file.")
+            print("[ERROR] Unsupported file format. Please provide an M3U, CSV, or JSON file.")
             return
     else:
         spawn_ids = [id.strip() for id in input_path.split(",") if id.strip()]
@@ -875,6 +879,35 @@ def parse_csv_for_spawn_ids(csv_path):
             line = line.strip()
             if line:
                 spawn_ids.append(line)
+    return spawn_ids
+
+
+def parse_json_for_spawn_ids(json_path):
+    """
+    Load a JSON file containing either a single object or a list of
+    objects with a 'spawn_id' field, and return a list of those IDs.
+    """
+    spawn_ids = []
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[ERROR] Failed to open or parse JSON file: {e}")
+        return spawn_ids
+
+    # normalize into a list of entries
+    entries = data if isinstance(data, list) else [data]
+
+    for entry in entries:
+        if isinstance(entry, dict):
+            sid = entry.get("spawn_id", "")
+            if isinstance(sid, str) and sid.strip():
+                spawn_ids.append(sid.strip())
+            else:
+                print(f"[WARNING] JSON entry missing valid 'spawn_id': {entry}")
+        else:
+            print(f"[WARNING] Skipping non-object JSON entry: {entry}")
+
     return spawn_ids
 
 
