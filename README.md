@@ -1,16 +1,16 @@
-# Spawn
+# Cave
 
-**Spawn** is a Python‑based audio manager that imports music tracks, standardizes and enriches metadata (tags, MBIDs, ReplayGain, etc.), and provides a flexible system for favorites, curation, and playback. It also automatically creates symlinks for all imported tracks to enable universal playlist functionality.
+**Cave** is a Python‑based audio manager that imports music tracks, standardizes and enriches metadata (tags, MBIDs, ReplayGain, etc.), and provides a flexible system for favorites, curation, and playback. It also automatically creates symlinks for all imported tracks to enable universal playlist functionality.
 
 ## Table of Contents
 
-- [Spawn](#spawn)
+- [Cave](#cave)
   - [Table of Contents](#table-of-contents)
   - [Features](#features)
   - [Installation](#installation)
     - [System Requirements](#system-requirements)
     - [Python Dependencies](#python-dependencies)
-    - [Before Running Spawn](#before-running-spawn)
+    - [Before Running Cave](#before-running-cave)
       - [If you have Python \>= 3.13](#if-you-have-python--313)
   - [Library Directory Structure](#library-directory-structure)
   - [Usage](#usage)
@@ -28,7 +28,7 @@
 ## Features
 
 - **Audio Import & Standardization:**  
-  Import audio files (AAC, ALAC, FLAC, MP4) and convert them to a standardized M4A format. During import, Spawn:
+  Import audio files (AAC, ALAC, FLAC, MP4) and convert them to a standardized M4A format. During import, Cave:
   - Cleans and repackages audio using ffmpeg, MP4Box, and bs1770gain (for ReplayGain).
   - Automatically extracts, canonicalizes, and enriches metadata including MusicBrainz IDs, AcoustID fingerprints, and Spotify track IDs.
   - Computes album‑level ReplayGain and assigns a unique 8‑digit hexadecimal Spawn ID to each track.
@@ -38,7 +38,7 @@
   Manage and update your favorite artists, albums, or tracks. Favorites are stored in JSON files and can be used to filter curated playlists.
 
 - **Curated Playlists:**  
-  Spawn supports several playlist curation methods:
+  Cave supports several playlist curation methods:
   - **Basic Curation:** Groups tracks by genre (using a comprehensive genre dictionary with subgenre and synonym support), then shuffles tracks within each cluster.
   - **Feature‑Based Curation:** Uses numeric audio features (e.g. tempo, loudness) to reorder tracks in each genre cluster.
   - **Advanced Curation:** Leverages track embeddings and a trained ML model to implement a “chain‑based” nearest‑neighbor approach for smooth transitions between tracks, based on the Deej-AI project (https://github.com/teticio/Deej-AI)
@@ -126,7 +126,7 @@ pip install standard-aifc standard-sunau
 
 ## Library Directory Structure
 
-When you import tracks, Spawn organizes your library under your LIB_PATH/Spawn directory. An example structure is as follows:
+When you import tracks, Cave organizes your library under your LIB_PATH/Spwen directory. An example structure is as follows:
 
 ```
 LIB_PATH/Spawn
@@ -264,4 +264,4 @@ Contributions are welcome! To contribute:
 - Submit bug reports, feature requests, or code improvements.
 - For major changes, please open an issue first to discuss your ideas.
 
-Thanks for using Spawn! If you have any questions or issues, please contact us at spawn.id.0000@gmail.com.
+Thanks for using Spawn & Cave! If you have any questions or issues, please contact us at spawn.id.0000@gmail.com.
